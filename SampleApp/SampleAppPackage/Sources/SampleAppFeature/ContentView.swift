@@ -14,6 +14,7 @@ public struct ContentView: View {
                     HeroCard(lab: lab)
                     planCard
                     traceCard
+                    performanceCard
                 }
                 .padding(.horizontal, 16)
                 .padding(.bottom, 32)
@@ -27,8 +28,8 @@ public struct ContentView: View {
         DemoCard {
             CardHeading(
                 number: "01",
-                title: "Run the boot plan",
-                detail: "Root steps wait for each other. The two service steps overlap inside Parallel."
+                title: "Start and await readiness",
+                detail: "The cache gets a 0.3-second readiness budget, then the same step continues without delaying the app."
             )
 
             VStack(spacing: 10) {
@@ -47,6 +48,14 @@ public struct ContentView: View {
                     .font(.caption.weight(.bold))
                     .foregroundStyle(.tertiary)
 
+                NonBlockingStepGroup {
+                    StepRow(step: lab.step(.cache))
+                }
+
+                Image(systemName: "arrow.down")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(.tertiary)
+
                 StepRow(step: lab.step(.routing))
             }
 
@@ -55,7 +64,7 @@ public struct ContentView: View {
             } label: {
                 HStack {
                     Image(systemName: lab.isRunning ? "hourglass" : "play.fill")
-                    Text(lab.isRunning ? "Running plan…" : lab.hasRun ? "Replay plan" : "Run plan")
+                    Text(lab.isRunning ? "Booting…" : lab.hasRun ? "Restart boot" : "Start boot")
                     Spacer()
                     if lab.isRunning {
                         ProgressView().tint(.white)
@@ -79,7 +88,7 @@ public struct ContentView: View {
             CardHeading(
                 number: "02",
                 title: "Inspect execution",
-                detail: "Start and finish events make ordering and overlap visible without relying on console output."
+                detail: "Readiness appears before the cache step completes, making its one-way transition visible without relying on console output."
             )
 
             if lab.events.isEmpty {
@@ -116,6 +125,57 @@ public struct ContentView: View {
             }
         }
     }
+
+    private var performanceCard: some View {
+        DemoCard {
+            CardHeading(
+                number: "03",
+                title: "Inspect performance",
+                detail: "These intervals come from BootInstrumentation, the same release-safe stream available to Instruments and telemetry."
+            )
+
+            if lab.measurements.isEmpty {
+                ContentUnavailableView(
+                    "No measurements yet",
+                    systemImage: "gauge.with.dots.needle.50percent",
+                    description: Text("Run the plan to measure its orchestration boundaries.")
+                )
+                .frame(minHeight: 120)
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(
+                        Array(lab.measurements.enumerated()),
+                        id: \.offset
+                    ) { index, measurement in
+                        HStack(alignment: .firstTextBaseline, spacing: 12) {
+                            Text(measurement.formattedDuration)
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                                .frame(width: 62, alignment: .trailing)
+
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(measurement.scopeTitle)
+                                    .font(.subheadline.weight(.semibold))
+                                Text(measurement.scopeDetail)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            Spacer()
+
+                            Image(systemName: measurement.outcomeSymbol)
+                                .foregroundStyle(measurement.outcomeTint)
+                        }
+                        .padding(.vertical, 9)
+
+                        if index != lab.measurements.count - 1 {
+                            Divider().padding(.leading, 74)
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 @Observable
@@ -125,6 +185,7 @@ private final class BootLab {
         case foundation
         case session
         case flags
+        case cache
         case routing
     }
 
@@ -144,6 +205,11 @@ private final class BootLab {
             title: "Load feature flags",
             detail: "Parallel · 0.8 seconds"
         ),
+        .cache: LabStep(
+            id: .cache,
+            title: "Warm disk cache",
+            detail: "Demotes after 0.3s · utility · 2.0s total"
+        ),
         .routing: LabStep(
             id: .routing,
             title: "Prepare routing",
@@ -151,11 +217,20 @@ private final class BootLab {
         ),
     ]
     private(set) var events: [LabEvent] = []
+    private(set) var measurements: [BootInstrumentation.Measurement] = []
     private(set) var isRunning = false
     private(set) var hasRun = false
 
     private var startedAt: ContinuousClock.Instant?
     private var runTask: Task<Void, Never>?
+    private var bootstrap: Bootstrap?
+    private var runGeneration = 0
+    private var runAttempt: UInt64 = 0
+
+    init() {
+        Hajime.debug = .trace
+        bootstrap = makeBootstrap()
+    }
 
     func step(_ id: StepID) -> LabStep {
         steps[id]!
@@ -163,17 +238,21 @@ private final class BootLab {
 
     func run() {
         reset()
+        runAttempt &+= 1
         isRunning = true
         hasRun = true
         startedAt = .now
-        append("Plan started", kind: .plan)
+        append("Boot started", kind: .plan)
+
+        guard let bootstrap else { return }
+        bootstrap.start()
 
         runTask = Task { [weak self] in
             guard let self else { return }
 
             do {
-                try await makeBootstrap().run()
-                append("Plan completed", kind: .plan)
+                try await bootstrap.waitUntilReady()
+                append("App ready · isReady=\(bootstrap.isReady)", kind: .plan)
             } catch is CancellationError {
                 return
             } catch {
@@ -186,11 +265,14 @@ private final class BootLab {
     }
 
     func reset() {
+        runGeneration &+= 1
+        bootstrap?.cancel()
         runTask?.cancel()
         runTask = nil
         isRunning = false
         hasRun = false
         events = []
+        measurements = []
         startedAt = nil
 
         for id in StepID.allCases {
@@ -199,7 +281,14 @@ private final class BootLab {
     }
 
     private func makeBootstrap() -> Bootstrap {
-        Bootstrap {
+        Bootstrap(
+            "app-launch",
+            instrumentation: .measurements { [weak self] measurement in
+                Task { @MainActor [weak self] in
+                    self?.record(measurement)
+                }
+            }
+        ) {
             BootStep("configure-foundation") { @MainActor [weak self] in
                 try await self?.perform(.foundation, for: .milliseconds(600))
             }
@@ -213,22 +302,40 @@ private final class BootLab {
                 }
             }
 
+            BootStep(
+                "warm-disk-cache",
+                priority: .utility
+            ) { @MainActor [weak self] in
+                try await self?.perform(.cache, for: .seconds(2))
+            }
+            .nonBlocking(after: .milliseconds(300))
+
             BootStep("prepare-routing") { @MainActor [weak self] in
                 try await self?.perform(.routing, for: .milliseconds(500))
             }
         }
     }
 
+    private func record(_ measurement: BootInstrumentation.Measurement) {
+        guard hasRun, measurement.attempt == runAttempt else { return }
+        measurements.append(measurement)
+        measurements.sort { $0.startOffset < $1.startOffset }
+    }
+
     private func perform(_ id: StepID, for duration: Duration) async throws {
+        let generation = runGeneration
         steps[id]?.state = .running
         append("\(step(id).title) started", kind: .started)
 
         do {
             try await Task.sleep(for: duration)
+            guard generation == runGeneration else { return }
             steps[id]?.state = .completed
             append("\(step(id).title) completed", kind: .completed)
         } catch {
-            steps[id]?.state = .pending
+            if generation == runGeneration {
+                steps[id]?.state = .pending
+            }
             throw error
         }
     }
@@ -242,6 +349,78 @@ private final class BootLab {
         }
 
         events.append(LabEvent(message: message, kind: kind, duration: elapsed))
+    }
+}
+
+private extension BootInstrumentation.Measurement {
+    var scopeTitle: String {
+        switch scope {
+        case .bootstrap: "Complete boot"
+        case .scheduling: "Scheduling"
+        case .step(let name, _): name
+        case .operation(let step): "\(step) operation"
+        case .signalWait(let signal, _): "Wait for \(signal)"
+        case .signalHandler(let signals, _): "Handle \(signals.joined(separator: ", "))"
+        case .parallel: "Parallel group"
+        case .nonBlocking(let step): "\(step) after readiness"
+        case .readinessBudget(let step): "\(step) readiness budget"
+        }
+    }
+
+    var scopeDetail: String {
+        switch scope {
+        case .bootstrap:
+            "attempt \(attempt) · request to readiness"
+        case .scheduling:
+            "request to execution"
+        case .step(_, let priority):
+            "complete step · priority \(priority.sampleDescription)"
+        case .operation:
+            "step closure only"
+        case .signalWait(_, let step), .signalHandler(_, let step):
+            "step \(step)"
+        case .parallel:
+            "all children"
+        case .nonBlocking:
+            "continued after releasing readiness"
+        case .readinessBudget:
+            "blocking until completion or configured budget"
+        }
+    }
+
+    var formattedDuration: String {
+        let components = duration.components
+        let milliseconds = components.seconds * 1_000
+            + components.attoseconds / 1_000_000_000_000_000
+        return String(format: "%.0f ms", Double(milliseconds))
+    }
+
+    var outcomeSymbol: String {
+        switch outcome {
+        case .succeeded: "checkmark.circle.fill"
+        case .failed: "xmark.octagon.fill"
+        case .cancelled: "slash.circle.fill"
+        case .releasedReadiness: "arrow.up.right.circle.fill"
+        }
+    }
+
+    var outcomeTint: Color {
+        switch outcome {
+        case .succeeded: .green
+        case .failed: .red
+        case .cancelled: .secondary
+        case .releasedReadiness: .teal
+        }
+    }
+}
+
+private extension TaskPriority {
+    var sampleDescription: String {
+        if self == .userInitiated { return "user initiated" }
+        if self == .medium { return "medium" }
+        if self == .utility { return "utility" }
+        if self == .background { return "background" }
+        return "custom"
     }
 }
 
@@ -340,8 +519,10 @@ private struct HeroCard: View {
                 Label("Sequence", systemImage: "arrow.down")
                 Spacer()
                 Label("Parallel", systemImage: "arrow.left.and.right")
+                Spacer()
+                Label("Non-blocking", systemImage: "arrow.turn.up.right")
             }
-            .font(.subheadline.weight(.semibold))
+            .font(.caption.weight(.semibold))
             .padding(12)
             .background(.black.opacity(0.15), in: RoundedRectangle(cornerRadius: 14))
         }
@@ -360,9 +541,9 @@ private struct HeroCard: View {
     }
 
     private var status: String {
-        if lab.isRunning { return "RUNNING" }
-        if lab.hasRun { return "COMPLETE" }
-        return "READY"
+        if lab.isRunning { return "BOOTING" }
+        if lab.hasRun { return "READY" }
+        return "IDLE"
     }
 }
 
@@ -381,6 +562,28 @@ private struct ParallelGroup<Content: View>: View {
         .overlay {
             RoundedRectangle(cornerRadius: 18)
                 .stroke(.indigo.opacity(0.2), style: StrokeStyle(lineWidth: 1, dash: [5]))
+        }
+    }
+}
+
+private struct NonBlockingStepGroup<Content: View>: View {
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("Non-blocking after 0.3s", systemImage: "arrow.turn.up.right")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(.teal)
+            content()
+        }
+        .padding(12)
+        .background(.teal.opacity(0.08), in: RoundedRectangle(cornerRadius: 18))
+        .overlay {
+            RoundedRectangle(cornerRadius: 18)
+                .stroke(
+                    .teal.opacity(0.25),
+                    style: StrokeStyle(lineWidth: 1, dash: [3, 4])
+                )
         }
     }
 }

@@ -5,21 +5,28 @@
 [![macOS 14+](https://img.shields.io/badge/macOS-14%2B-blue.svg)](Package.swift)
 
 `Hajime` is a Swift app-boot orchestration library built around an explicit
-sequence-and-parallel plan.
+readiness graph.
 
 Declare named asynchronous steps in the order they should run. Group independent
-work in `Parallel`, then execute the immutable plan from one bootstrap runner.
+readiness work in `Parallel`, apply a readiness policy to individual steps,
+then execute the immutable plan from one bootstrap runner.
 
 - Keep sequential startup dependencies legible in source order.
 - Begin independent operations concurrently inside explicit parallel groups.
+- Let selected steps continue without delaying application readiness.
+- Give slow steps a budget before they stop delaying readiness.
 - Extract reusable subplans without changing their ordering.
-- Propagate thrown failures and stop later sequential work.
+- Request an execution priority for each step, defaulting to `.userInitiated`.
+- Suspend work until the current boot execution reports readiness.
+- Bridge synchronous delegate callbacks into asynchronous boot steps.
+- Profile every boot boundary in Instruments or forward completed intervals.
+- Propagate readiness-blocking failures and stop later sequential work.
 - Preserve the actor isolation of each asynchronous operation.
 
 ```swift
 import Hajime
 
-let bootstrap = Bootstrap {
+let boot = Bootstrap("app-launch") {
   BootStep("configure-foundation") {
     configureFoundation()
   }
@@ -33,19 +40,25 @@ let bootstrap = Bootstrap {
     }
   }
 
+  BootStep("warm-cache", priority: .utility) {
+    try await cache.warm()
+  }
+  .nonBlocking()
+
   BootStep("prepare-routing") {
     try await router.prepare()
   }
 }
 
-try await bootstrap.run()
+boot.start()
+try await boot.waitUntilReady()
 ```
 
 ## Install
 
-Hajime currently requires Swift 6.3 and supports iOS 17+ and macOS 14+. It is
-under active development and does not have a tagged release yet. Add this
-checkout as a local Swift package while the initial API is being shaped.
+Hajime requires Swift 6.3 and supports iOS 17+ and macOS 14+. Add the repository
+as a local Swift package, then link the `Hajime` library product to the app
+target.
 
 ## Five-minute start
 
@@ -71,6 +84,11 @@ func makeBootstrap(
       }
     }
 
+    BootStep("warm-cache", priority: .utility) {
+      try await configuration.warmCache()
+    }
+    .nonBlocking(after: .milliseconds(300))
+
     BootStep("prepare-routing") {
       try await router.prepare()
     }
@@ -78,31 +96,175 @@ func makeBootstrap(
 }
 ```
 
-Call `run()` from the app-owned startup task. It returns after the complete plan
-succeeds. If one operation throws, Hajime skips later sequential declarations;
-a parallel failure also requests cancellation of unfinished siblings.
+Keep the `Bootstrap` as application-owned state, start its single execution
+pipe, and suspend consumers that require readiness:
 
 ```swift
-try await makeBootstrap(
+let boot = makeBootstrap(
   session: session,
   configuration: configuration,
   router: router
-).run()
+)
+
+boot.start()
+
+func handleDeepLink(_ url: URL) async throws {
+  try await boot.waitUntilReady()
+  await router.open(url)
+}
 ```
 
-Each call starts a new execution. Readiness, single-flight execution, blocking
-budgets, non-blocking failures, preview behavior, and delegate-driven signals
-are intentionally outside this first scaffold.
+`waitUntilReady()` may be called before `start()` and by multiple consumers. If
+one operation throws, Hajime skips later sequential declarations and resumes
+all readiness waiters with that error. A parallel failure also requests
+cancellation of unfinished siblings.
+
+Calling `start()` again cancels and replaces the current run. Existing waiters
+remain attached to the pipe and wait for the replacement. `isReady` and `state`
+provide synchronous snapshots for presentation and diagnostics; use
+`waitUntilReady()` for coordination.
+
+Every bootstrap emits low-overhead Instruments signposts by default in debug
+and release builds. Add one synchronous callback when the same completed
+intervals should feed an observability system:
+
+```swift
+let boot = Bootstrap(
+  "app-launch",
+  instrumentation: .measurements { measurement in
+    bootTelemetry.enqueue(measurement)
+  }
+) {
+  appBootPlan
+}
+```
+
+The callback receives the run identifier, execution attempt, scope, start
+offset, duration, and outcome. It should enqueue in constant time. Use
+`.disabled` for processes where neither signposts nor measurements are wanted.
 
 That is the core idea: declaration order expresses dependencies, and
-`Parallel` marks the work that can safely overlap.
+`Parallel` marks readiness work that can safely overlap. A step's
+`nonBlocking` modifier changes only how long that complete step contributes to
+readiness.
+
+Use `.nonBlocking()` to release readiness immediately, or
+`.nonBlocking(after:)` to let the step block until a budget expires. Budget
+expiry is a one-way transition, not a timeout: the same task keeps running and
+its later failure is contained. The policy covers the operation plus every
+signal wait and handler. Modifier order is immaterial, so
+`.waiting(for: signal).nonBlocking(after: duration)` and the reverse spelling
+behave identically.
+
+## Step priority
+
+`BootStep` defaults to `.userInitiated` because most boot declarations block
+immediate app use. Override it when an operation can tolerate less urgency:
+
+```swift
+BootStep("warm-disk-cache", priority: .utility) {
+  try await cache.warm()
+}
+.nonBlocking(after: .milliseconds(300))
+```
+
+Priority is an execution hint, not an ordering mechanism. Source order and
+`Parallel` continue to define execution order. Neither `nonBlocking()` nor
+`nonBlocking(after:)` changes a step's requested priority, and Swift may raise
+a step's effective priority when higher-priority work awaits it.
+
+## Delegate bridges
+
+Use an app-owned signals bag to connect delegate callbacks to boot steps. Both
+sides share the same signal; the delegate fulfills it synchronously without
+creating a `Task`:
+
+```swift
+import Hajime
+import UIKit
+
+struct AppBootSignals: Sendable {
+  let pushRegistration = BootSignal<Data>("push-registration")
+  let attestation = BootSignal<Data>("app-attestation")
+}
+
+let appBoot = AppBootSignals()
+appDelegate.pushRegistration = appBoot.pushRegistration
+
+let boot = Bootstrap {
+  BootStep("register-push-notifications") { @MainActor in
+    UIApplication.shared.registerForRemoteNotifications()
+  }
+  .waiting(for: appBoot.pushRegistration) { token in
+    try await server.send(token)
+  }
+}
+
+final class AppDelegate: NSObject, UIApplicationDelegate {
+  var pushRegistration: BootSignal<Data>!
+
+  func application(
+    _ application: UIApplication,
+    didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
+  ) {
+    pushRegistration.succeed(deviceToken)
+  }
+
+  func application(
+    _ application: UIApplication,
+    didFailToRegisterForRemoteNotificationsWithError error: any Error
+  ) {
+    pushRegistration.fail(error)
+  }
+}
+```
+
+The step finishes only after registration succeeds and `server.send(_:)`
+returns. Signal or handler failure fails the step. The modifier also registers
+the signal with this `Bootstrap`, so starting the same coordinator again rearms
+the same signal instance for the replacement run.
+
+Chain modifiers when independent callbacks and handlers may overlap:
+
+```swift
+BootStep("register-system-services") {
+  registerForPush()
+  requestAttestation()
+}
+.waiting(for: appBoot.pushRegistration) { token in
+  try await server.send(token)
+}
+.waiting(for: appBoot.attestation) { assertion in
+  try await server.send(assertion)
+}
+```
+
+Both waits begin concurrently, and the step finishes after both handlers. Use
+one grouped modifier when a handler needs two or three values together. A
+standalone `BootSignal` is an instance-lifetime one-shot bridge. Declaration
+through `.waiting(for:)` gives it one first-wins resolution per run of its
+owning bootstrap.
+
+## Documentation
+
+- [Readiness](docs/readiness.md) — start, replace, await, inspect, and cancel the
+  application boot pipe.
+- [Non-blocking work](docs/non-blocking-work.md) — let individual steps outlive
+  readiness immediately or after a budget.
+- [Signals](docs/signals.md) — bridge delegate and service callbacks into boot
+  steps, combine requirements, and rearm them safely for retries.
+- [Performance instrumentation](docs/instrumentation.md) — profile release
+  boots and forward one privacy-conscious stream of completed intervals.
+- [Diagnostics](docs/diagnostics.md) — inspect correlated lifecycle events and
+  their privacy contract.
 
 ## Sample app
 
 Open [`SampleApp/SampleApp.xcworkspace`](SampleApp/SampleApp.xcworkspace) and run the
 **SampleApp** scheme to inspect a deterministic boot timeline. The lab shows a
-sequential foundation step, two overlapping service steps, and a final routing
-step, with controls to run and reset the plan.
+sequential foundation step, two overlapping service steps, a cache warmup that
+continues after readiness, and a final routing step, with controls to run and
+reset the plan.
 
 ## License
 

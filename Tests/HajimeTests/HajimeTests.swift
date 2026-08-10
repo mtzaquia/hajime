@@ -44,12 +44,47 @@ private actor ExecutionTrace {
     }
 }
 
+private actor PriorityProbe {
+    private var recordedPriority: TaskPriority?
+    private var continuation: CheckedContinuation<TaskPriority, Never>?
+
+    func record(_ priority: TaskPriority) {
+        recordedPriority = priority
+        continuation?.resume(returning: priority)
+        continuation = nil
+    }
+
+    func next() async -> TaskPriority {
+        if let recordedPriority {
+            return recordedPriority
+        }
+
+        return await withCheckedContinuation { continuation in
+            self.continuation = continuation
+        }
+    }
+}
+
 private enum TestFailure: Error {
     case expected
 }
 
 @Suite("Boot plan DSL")
 struct BootPlanDSLTests {
+    @Test("Steps request user-initiated priority by default")
+    func requestsUserInitiatedPriorityByDefault() async throws {
+        let priority = try await recordedPriority(for: nil)
+
+        #expect(priority == .userInitiated)
+    }
+
+    @Test("Steps can request another execution priority")
+    func requestsCustomPriority() async throws {
+        let priority = try await recordedPriority(for: .utility)
+
+        #expect(priority == .utility)
+    }
+
     @Test("Root steps execute in declaration order")
     func executesRootStepsSequentially() async throws {
         let trace = ExecutionTrace()
@@ -229,5 +264,32 @@ struct BootPlanDSLTests {
         try await bootstrap.run()
 
         #expect(await trace.events == ["conditional", "loop-one", "loop-two"])
+    }
+
+    private func recordedPriority(
+        for priority: TaskPriority?
+    ) async throws -> TaskPriority {
+        let probe = PriorityProbe()
+        let step: BootStep
+        if let priority {
+            step = BootStep("priority", priority: priority) {
+                await probe.record(Task.currentPriority)
+            }
+        } else {
+            step = BootStep("priority") {
+                await probe.record(Task.currentPriority)
+            }
+        }
+
+        let bootstrap = Bootstrap {
+            step
+        }
+        let runTask = Task.detached(priority: .background) {
+            try await bootstrap.run()
+        }
+
+        let recordedPriority = await probe.next()
+        try await runTask.value
+        return recordedPriority
     }
 }

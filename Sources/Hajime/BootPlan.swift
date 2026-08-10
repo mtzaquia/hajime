@@ -42,9 +42,11 @@ public struct BootPlan: Sendable {
 
 /// A group whose direct child declarations begin concurrently.
 ///
-/// Execution leaves the group after every child succeeds. When a child throws,
-/// the group requests cancellation of its unfinished siblings and propagates an
-/// error to the surrounding plan.
+/// Execution leaves the group after every child either succeeds or releases
+/// readiness through ``BootStep/nonBlocking()`` or
+/// ``BootStep/nonBlocking(after:)``. When a child fails before releasing
+/// readiness, the group requests cancellation of its unfinished siblings and
+/// propagates the error to the surrounding plan.
 public struct Parallel: Sendable {
     fileprivate let plan: BootPlan
 
@@ -58,8 +60,8 @@ public struct Parallel: Sendable {
 
 /// Builds an immutable ``BootPlan`` from sequential declarations.
 ///
-/// Use this builder through ``Bootstrap/init(_:)``, ``BootPlan/init(_:)``, or
-/// ``Parallel/init(_:)`` rather than invoking its methods directly.
+/// Use this builder through ``Bootstrap/init(_:)``, ``BootPlan/init(_:)``,
+/// or ``Parallel/init(_:)`` rather than invoking its methods directly.
 @resultBuilder
 public enum BootPlanBuilder {
     /// Combines declarations into one sequential plan.
@@ -113,28 +115,43 @@ fileprivate indirect enum BootPlanNode: Sendable {
     case sequence([BootPlanNode])
     case parallel([BootPlanNode])
 
-    func execute() async throws {
+    func execute(context: BootExecutionContext) async throws {
+        try Task.checkCancellation()
+
         switch self {
         case .step(let step):
-            try await step.operation()
+            try await context.execute(step)
 
         case .sequence(let nodes):
             for node in nodes {
-                try await node.execute()
+                try await node.execute(context: context)
             }
 
         case .parallel(let nodes):
-            try await withThrowingTaskGroup(of: Void.self) { group in
-                for node in nodes {
-                    group.addTask {
-                        try await node.execute()
-                    }
-                }
+            try await context.instrumentation.measure(.parallel) {
+                hajimeLog.hajimeDebug(
+                    .parallelStarted(childCount: nodes.count)
+                )
 
                 do {
-                    while let _ = try await group.next() {}
+                    try await executeConcurrently(nodes) { node in
+                        try await node.execute(context: context)
+                    }
+                    hajimeLog.hajimeDebug(
+                        .parallelSucceeded(childCount: nodes.count)
+                    )
+                } catch is CancellationError {
+                    hajimeLog.hajimeDebug(
+                        .parallelCancelled(childCount: nodes.count)
+                    )
+                    throw CancellationError()
                 } catch {
-                    group.cancelAll()
+                    hajimeLog.hajimeDebug(
+                        .parallelFailed(
+                            childCount: nodes.count,
+                            error: error
+                        )
+                    )
                     throw error
                 }
             }
@@ -143,9 +160,87 @@ fileprivate indirect enum BootPlanNode: Sendable {
 }
 
 extension BootPlan {
-    func execute() async throws {
-        for node in nodes {
-            try await node.execute()
+    var stepCount: Int {
+        nodes.reduce(0) { $0 + $1.stepCount }
+    }
+
+    var parallelGroupCount: Int {
+        nodes.reduce(0) { $0 + $1.parallelGroupCount }
+    }
+
+    var nonBlockingStepCount: Int {
+        nodes.reduce(0) { $0 + $1.nonBlockingStepCount }
+    }
+
+    var signalBindings: [any BootSignalBinding] {
+        var identities: Set<ObjectIdentifier> = []
+        return nodes
+            .flatMap(\.signalBindings)
+            .filter { identities.insert($0.identity).inserted }
+    }
+
+    func execute(context: BootExecutionContext) async throws {
+        try await BootPlanNode.sequence(nodes).execute(context: context)
+    }
+}
+
+func executeConcurrently<Element: Sendable>(
+    _ elements: [Element],
+    operation: @escaping @Sendable (Element) async throws -> Void
+) async throws {
+    try await withThrowingTaskGroup(of: Void.self) { group in
+        for element in elements {
+            group.addTask {
+                try await operation(element)
+            }
+        }
+
+        do {
+            while let _ = try await group.next() {}
+            try Task.checkCancellation()
+        } catch {
+            group.cancelAll()
+            throw error
+        }
+    }
+}
+
+private extension BootPlanNode {
+    var signalBindings: [any BootSignalBinding] {
+        switch self {
+        case .step(let step):
+            step.waitRequirements.flatMap(\.signals)
+        case .sequence(let nodes), .parallel(let nodes):
+            nodes.flatMap(\.signalBindings)
+        }
+    }
+
+    var stepCount: Int {
+        switch self {
+        case .step:
+            1
+        case .sequence(let nodes), .parallel(let nodes):
+            nodes.reduce(0) { $0 + $1.stepCount }
+        }
+    }
+
+    var parallelGroupCount: Int {
+        switch self {
+        case .step:
+            0
+        case .sequence(let nodes):
+            nodes.reduce(0) { $0 + $1.parallelGroupCount }
+        case .parallel(let nodes):
+            1 + nodes.reduce(0) { $0 + $1.parallelGroupCount }
+        }
+    }
+
+    var nonBlockingStepCount: Int {
+        switch self {
+        case .step(let step):
+            step.readiness.mayReleaseReadiness ? 1 : 0
+        case .sequence(let nodes), .parallel(let nodes):
+            nodes.reduce(0) { $0 + $1.nonBlockingStepCount }
         }
     }
 }
