@@ -3,6 +3,7 @@
 [![Swift 6.3](https://img.shields.io/badge/Swift-6.3-orange.svg)](https://www.swift.org/)
 [![iOS 17+](https://img.shields.io/badge/iOS-17%2B-blue.svg)](Package.swift)
 [![macOS 14+](https://img.shields.io/badge/macOS-14%2B-blue.svg)](Package.swift)
+[![Tests](https://github.com/mtzaquia/hajime/actions/workflows/tests.yml/badge.svg)](https://github.com/mtzaquia/hajime/actions/workflows/tests.yml)
 
 `Hajime` is a Swift app-boot orchestration library built around an explicit
 readiness graph.
@@ -56,9 +57,28 @@ try await boot.waitUntilReady()
 
 ## Install
 
-Hajime requires Swift 6.3 and supports iOS 17+ and macOS 14+. Add the repository
-as a local Swift package, then link the `Hajime` library product to the app
-target.
+Hajime requires Swift 6.3 and supports iOS 17+ and macOS 14+. Add it with Swift
+Package Manager:
+
+```swift
+dependencies: [
+  .package(
+    url: "https://github.com/mtzaquia/hajime.git",
+    from: "1.0.0"
+  ),
+]
+```
+
+Then add the `Hajime` product to your target dependencies:
+
+```swift
+.target(
+  name: "YourApp",
+  dependencies: [
+    .product(name: "Hajime", package: "Hajime"),
+  ]
+)
+```
 
 ## Five-minute start
 
