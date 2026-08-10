@@ -1,8 +1,8 @@
 # Readiness
 
 `Bootstrap` owns one application boot pipe. It starts the immutable plan,
-publishes a synchronous lifecycle snapshot, and suspends consumers until the
-current execution succeeds.
+publishes an observable lifecycle snapshot and a current-value stream, and
+suspends consumers until the current execution succeeds.
 
 ## Start application boot
 
@@ -78,17 +78,90 @@ case .booting:
   // the current plan is running
 case .ready:
   // readiness-dependent work may proceed
-case .failed:
-  // a step threw a non-cancellation error
+case .failed(let failure):
+  // failure.error is the error thrown by the step
 case .cancelled:
   // the current execution ended with cancellation
 }
 ```
 
 `isReady` is shorthand for `state == .ready`. Both properties are synchronous,
-concurrency-safe snapshots intended for presentation and diagnostics. They can
-change after a later `start()`, so use `waitUntilReady()` instead of polling or
-check-then-act control flow.
+concurrency-safe snapshots intended for presentation and diagnostics. `State`
+equality compares lifecycle phases, so two `.failed` values compare equal even
+when their retained errors differ. Pattern-match `.failed(let failure)` when
+the error matters.
+
+`failure.error` is the original `Error`, which is `Sendable` in Swift 6. Map
+app-owned errors to user-facing copy explicitly. `failure.errorType` contains
+only the concrete type name and is suitable when privacy-safe metadata is
+enough; Hajime never derives a description or associated values for you.
+
+`Bootstrap` conforms to the Observation framework, so SwiftUI invalidates a
+view that reads either property when the lifecycle changes:
+
+```swift
+import Hajime
+import SwiftUI
+
+struct AppRoot: View {
+  let boot: Bootstrap
+
+  var body: some View {
+    Group {
+      switch boot.state {
+      case .idle, .booting:
+        ProgressView("Starting…")
+      case .ready:
+        AppContent()
+      case .failed(let failure):
+        BootFailureView(error: failure.error, retry: boot.start)
+      case .cancelled:
+        BootCancelledView(retry: boot.start)
+      }
+    }
+    .task {
+      if boot.state == .idle {
+        boot.start()
+      }
+    }
+  }
+}
+```
+
+Keep the `Bootstrap` at the application composition root and pass the same
+instance into the view hierarchy. No app-owned `@State` mirror, view model, or
+SwiftUI-specific Hajime adapter is required. Hajime imports Observation for
+change tracking but does not depend on SwiftUI or require main-actor ownership.
+
+## Observe state asynchronously
+
+Use `stateUpdates` when a non-UI consumer needs lifecycle updates:
+
+```swift
+for await state in boot.stateUpdates {
+  bootTelemetry.record(state)
+}
+```
+
+Each property access creates an independent subscription and immediately emits
+one state captured atomically with registration. Starting, completing, failing,
+cancelling, or replacing an execution then emits its lifecycle transition. A
+replacement requested while already booting emits `.booting` again because it
+represents a new execution even though the snapshot value is unchanged.
+
+State transitions are semantic events, so each active subscription retains its
+unconsumed transitions in order. A slow subscriber therefore receives every
+replacement and terminal state rather than silently coalescing them. Cancel
+subscriptions that no longer have a consumer. Releasing the `Bootstrap`
+publishes cancellation when needed, finishes every stream, and does not require
+subscribers to retain the coordinator.
+
+Iterate a separate `stateUpdates` value in each task. Cancelling one subscriber
+removes only that subscription and does not cancel boot or other subscribers.
+
+These observation APIs can change after a later `start()`. Use
+`waitUntilReady()` instead of polling, stream iteration, or check-then-act
+control flow when subsequent work requires readiness.
 
 ## Own or cancel the full run
 

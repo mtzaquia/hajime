@@ -219,7 +219,10 @@ struct BootstrapReadinessTests {
         await #expect(throws: ReadinessFailure.self) {
             try await bootstrap.waitUntilReady()
         }
-        #expect(bootstrap.state == .failed)
+        guard case .failed = bootstrap.state else {
+            Issue.record("Expected boot to fail")
+            return
+        }
         #expect(!bootstrap.isReady)
     }
 

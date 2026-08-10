@@ -108,7 +108,10 @@ struct BootStepWaitingTests {
             try await bootstrap.waitUntilReady()
         }
         #expect(await trace.events.isEmpty)
-        #expect(bootstrap.state == .failed)
+        guard case .failed = bootstrap.state else {
+            Issue.record("Expected boot to fail")
+            return
+        }
     }
 
     @Test("A signal handler failure fails the step")
@@ -316,7 +319,10 @@ struct BootStepWaitingTests {
         ) {
             try await bootstrap.run()
         }
-        #expect(bootstrap.state == .failed)
+        guard case .failed = bootstrap.state else {
+            Issue.record("Expected boot to fail")
+            return
+        }
     }
 
     @Test("One signal cannot be managed by two bootstraps")

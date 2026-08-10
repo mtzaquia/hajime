@@ -19,6 +19,7 @@ then execute the immutable plan from one bootstrap runner.
 - Extract reusable subplans without changing their ordering.
 - Request an execution priority for each step, defaulting to `.userInitiated`.
 - Suspend work until the current boot execution reports readiness.
+- Render SwiftUI directly from the observed boot lifecycle.
 - Bridge synchronous delegate callbacks into asynchronous boot steps.
 - Profile every boot boundary in Instruments or forward completed intervals.
 - Propagate readiness-blocking failures and stop later sequential work.
@@ -141,8 +142,40 @@ cancellation of unfinished siblings.
 
 Calling `start()` again cancels and replaces the current run. Existing waiters
 remain attached to the pipe and wait for the replacement. `isReady` and `state`
-provide synchronous snapshots for presentation and diagnostics; use
-`waitUntilReady()` for coordination.
+provide synchronous observable snapshots for presentation and diagnostics. A
+SwiftUI view can read them directly without copying lifecycle state into local
+`@State`:
+
+```swift
+import Hajime
+import SwiftUI
+
+struct AppRoot: View {
+  let boot: Bootstrap
+
+  var body: some View {
+    switch boot.state {
+    case .idle, .booting:
+      ProgressView("Starting…")
+    case .ready:
+      AppContent()
+    case .failed(let failure):
+      BootFailureView(error: failure.error, retry: boot.start)
+    case .cancelled:
+      BootCancelledView(retry: boot.start)
+    }
+  }
+}
+```
+
+Hajime uses the Observation framework but does not depend on SwiftUI. The
+failure retains the original error for app-owned presentation and exposes
+`errorType` when only privacy-safe type metadata is appropriate. Hajime never
+turns the error into a description on the application's behalf.
+
+For non-UI observation, each access to `stateUpdates` creates an independent
+current-value stream of the same states. Use `waitUntilReady()` for coordination
+rather than polling or treating presentation observation as a readiness gate.
 
 Every bootstrap emits low-overhead Instruments signposts by default in debug
 and release builds. Add one synchronous callback when the same completed
@@ -267,8 +300,8 @@ owning bootstrap.
 
 ## Documentation
 
-- [Readiness](docs/readiness.md) — start, replace, await, inspect, and cancel the
-  application boot pipe.
+- [Readiness](docs/readiness.md) — start, replace, await, observe, and cancel the
+  application boot pipe, including direct SwiftUI rendering.
 - [Non-blocking work](docs/non-blocking-work.md) — let individual steps outlive
   readiness immediately or after a budget.
 - [Signals](docs/signals.md) — bridge delegate and service callbacks into boot

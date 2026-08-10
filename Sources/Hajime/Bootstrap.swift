@@ -21,6 +21,7 @@
 //
 
 import Foundation
+import Observation
 import os
 
 /// Owns one replaceable execution of an immutable application boot plan.
@@ -29,9 +30,34 @@ import os
 /// suspend until the current execution succeeds. Starting again cancels and
 /// supersedes the previous execution. Existing readiness waiters follow the
 /// replacement execution. Releasing the coordinator requests cancellation of
-/// its current readiness chain and outstanding non-blocking steps.
-public final class Bootstrap: Sendable {
+/// its current readiness chain and outstanding non-blocking steps. The
+/// coordinator participates in the Observation framework, and
+/// ``stateUpdates`` provides the same lifecycle as an asynchronous stream.
+public final class Bootstrap: Observable, Sendable {
+    /// A failure from the current boot execution.
+    ///
+    /// The original ``error`` is retained so an application can map its own
+    /// errors to presentation. ``errorType`` is the privacy-safe concrete type
+    /// name Hajime uses for diagnostics. Hajime does not convert the error to a
+    /// description or expose its associated values as metadata.
+    public struct Failure: Sendable {
+        /// The error thrown by the boot step that ended the execution.
+        public let error: any Error
+
+        /// The concrete error type name without a description or payload.
+        public let errorType: String
+
+        init(_ error: any Error) {
+            self.error = error
+            errorType = error.hajimeTypeDescription
+        }
+    }
+
     /// The current lifecycle state of a bootstrap coordinator.
+    ///
+    /// Equality compares lifecycle phases. Two failed states are equal even
+    /// when their retained errors differ, so state comparisons remain useful
+    /// for presentation while the associated ``Failure`` remains available.
     public enum State: Equatable, Sendable {
         /// No execution has been started.
         case idle
@@ -42,11 +68,27 @@ public final class Bootstrap: Sendable {
         /// The current execution completed successfully.
         case ready
 
-        /// The current execution ended because a boot step threw an error.
-        case failed
+        /// The current execution ended with the retained boot-step failure.
+        case failed(Failure)
 
         /// The current execution ended with cancellation.
         case cancelled
+
+        /// Returns whether two values represent the same lifecycle phase.
+        ///
+        /// Associated failures are deliberately ignored.
+        public static func == (lhs: State, rhs: State) -> Bool {
+            switch (lhs, rhs) {
+            case (.idle, .idle),
+                 (.booting, .booting),
+                 (.ready, .ready),
+                 (.failed, .failed),
+                 (.cancelled, .cancelled):
+                true
+            default:
+                false
+            }
+        }
     }
 
     private let plan: BootPlan
@@ -55,7 +97,8 @@ public final class Bootstrap: Sendable {
     private let instrumentation: BootInstrumentation
     private let ownerID = UUID()
     private let coordinator = BootstrapCoordinator()
-    private let startLock = OSAllocatedUnfairLock(initialState: ())
+    private let lifecycleLock = OSAllocatedUnfairLock(initialState: ())
+    private let observationRegistrar = ObservationRegistrar()
 
     /// Creates a bootstrap coordinator from inline boot declarations.
     ///
@@ -95,27 +138,54 @@ public final class Bootstrap: Sendable {
     }
 
     deinit {
-        cancelExecution()
+        cancelExecution(observingState: false)
+        coordinator.finishStateUpdates()
     }
 
     /// The lifecycle state of the current execution.
     ///
-    /// This snapshot is safe to read from any isolation domain. Use
-    /// ``waitUntilReady()`` instead when subsequent work requires readiness.
+    /// This observable snapshot is safe to read from any isolation domain.
+    /// SwiftUI views can switch over it directly, including the underlying
+    /// failure, and invalidate when the state changes. A later ``start()``
+    /// replaces a retained failure with ``State/booting``.
+    ///
+    /// Use ``waitUntilReady()`` instead when subsequent work requires readiness.
     public var state: State {
-        coordinator.state
+        observationRegistrar.access(self, keyPath: \.state)
+        return coordinator.state
+    }
+
+    /// A current-value stream of lifecycle state changes.
+    ///
+    /// Each access creates an independent subscription and immediately emits a
+    /// coherent snapshot of ``state``. The stream then emits every lifecycle
+    /// transition observed by that subscription, including replacement starts,
+    /// and finishes after the ``Bootstrap`` is released. Because these are
+    /// semantic events, an active subscription retains unconsumed transitions
+    /// until its iterator advances or its task is cancelled.
+    ///
+    /// Cancelling a task iterating the stream removes only that subscription and
+    /// does not cancel application boot. Use ``waitUntilReady()`` instead when
+    /// subsequent work must coordinate with readiness.
+    public var stateUpdates: AsyncStream<State> {
+        coordinator.makeStateUpdates()
     }
 
     /// Whether the current execution completed successfully.
     ///
-    /// This snapshot is intended for presentation and diagnostics. Use
-    /// ``waitUntilReady()`` for control flow that must suspend until readiness.
+    /// This observable snapshot is intended for presentation and diagnostics.
+    /// Use ``waitUntilReady()`` for control flow that must suspend until
+    /// readiness.
     public var isReady: Bool {
         state == .ready
     }
 
     var hasOutstandingNonBlockingSteps: Bool {
         coordinator.hasOutstandingNonBlockingSteps
+    }
+
+    var stateUpdateSubscriberCount: Int {
+        coordinator.stateUpdateSubscriberCount
     }
 
     /// Starts the boot plan and supersedes any current execution.
@@ -130,9 +200,10 @@ public final class Bootstrap: Sendable {
     /// ``BootStep/nonBlocking()`` or ``BootStep/nonBlocking(after:)`` receive
     /// cancellation but do not delay the replacement.
     public func start() {
-        startLock.withLock {
+        lifecycleLock.withLock {
             startExecution()
         }
+        notifyStateChanged()
     }
 
     /// Suspends until the current boot execution is ready.
@@ -173,7 +244,12 @@ public final class Bootstrap: Sendable {
     /// cancellation. Boot-step cancellation remains cooperative. Calling
     /// ``start()`` afterward begins a new execution.
     public func cancel() {
-        cancelExecution()
+        let changedState = lifecycleLock.withLock {
+            cancelExecution()
+        }
+        if changedState {
+            notifyStateChanged()
+        }
     }
 
     /// Starts the plan and returns after the current execution becomes ready.
@@ -206,7 +282,7 @@ public final class Bootstrap: Sendable {
         }
 
         let task = Task {
-            [plan, signalBindings, ownerID, coordinator,
+            [weak self, plan, signalBindings, ownerID, coordinator,
              context = preparation.context] in
             let result: Result<Void, any Error>
             let run = BootSignalRun(
@@ -234,10 +310,17 @@ public final class Bootstrap: Sendable {
             }
 
             context.instrumentation.finish(result)
-            coordinator.finish(
-                generation: preparation.generation,
-                result: result
-            )
+            if let self {
+                finishExecution(
+                    generation: preparation.generation,
+                    result: result
+                )
+            } else {
+                coordinator.finish(
+                    generation: preparation.generation,
+                    result: result
+                )?.forEach { $0.resume(with: result) }
+            }
         }
 
         coordinator.install(
@@ -246,7 +329,29 @@ public final class Bootstrap: Sendable {
         )
     }
 
-    private func cancelExecution() {
+    private func finishExecution(
+        generation: UInt64,
+        result: Result<Void, any Error>
+    ) {
+        let waiters: [BootstrapCoordinator.Waiter]? = lifecycleLock.withLock {
+            guard coordinator.isCurrent(generation: generation) else {
+                return nil
+            }
+
+            return coordinator.finish(
+                generation: generation,
+                result: result
+            )
+        }
+
+        guard let waiters else { return }
+        notifyStateChanged()
+        waiters.forEach { $0.resume(with: result) }
+    }
+
+    @discardableResult
+    private func cancelExecution(observingState: Bool = true) -> Bool {
+        let changedState = coordinator.cancelChangesState
         let cancellation = coordinator.cancel()
         cancellation.task?.cancel()
         cancellation.context?.cancelNonBlockingSteps()
@@ -257,6 +362,11 @@ public final class Bootstrap: Sendable {
         cancellation.waiters.forEach {
             $0.resume(throwing: CancellationError())
         }
+        return observingState && changedState
+    }
+
+    private func notifyStateChanged() {
+        observationRegistrar.withMutation(of: self, keyPath: \.state) {}
     }
 
     private static func execute(
@@ -317,6 +427,10 @@ private final class BootstrapCoordinator: Sendable {
         var task: Task<Void, Never>?
         var context: BootExecutionContext?
         var waiters: [UUID: Waiter] = [:]
+        var stateUpdates: [
+            UUID: AsyncStream<Bootstrap.State>.Continuation
+        ] = [:]
+        var stateUpdatesFinished = false
     }
 
     private let lock = OSAllocatedUnfairLock(initialState: Storage())
@@ -325,15 +439,30 @@ private final class BootstrapCoordinator: Sendable {
         lock.withLock { $0.state }
     }
 
+    var cancelChangesState: Bool {
+        lock.withLock {
+            switch $0.state {
+            case .idle, .booting:
+                true
+            case .ready, .failed, .cancelled:
+                false
+            }
+        }
+    }
+
     var hasOutstandingNonBlockingSteps: Bool {
         lock.withLock { $0.context?.hasNonBlockingSteps == true }
+    }
+
+    var stateUpdateSubscriberCount: Int {
+        lock.withLock { $0.stateUpdates.count }
     }
 
     func prepareForStart(
         name: String,
         instrumentation: BootInstrumentation
     ) -> Preparation {
-        lock.withLock { storage in
+        let (preparation, stateUpdates) = lock.withLock { storage in
             let supersededGeneration = storage.generation == 0
                 ? nil
                 : storage.generation
@@ -352,14 +481,19 @@ private final class BootstrapCoordinator: Sendable {
             storage.result = nil
             storage.task = nil
             storage.context = context
-            return Preparation(
-                generation: storage.generation,
-                supersededGeneration: supersededGeneration,
-                supersededTask: supersededTask,
-                supersededContext: supersededContext,
-                context: context
+            return (
+                Preparation(
+                    generation: storage.generation,
+                    supersededGeneration: supersededGeneration,
+                    supersededTask: supersededTask,
+                    supersededContext: supersededContext,
+                    context: context
+                ),
+                Array(storage.stateUpdates.values)
             )
         }
+        stateUpdates.forEach { $0.yield(.booting) }
+        return preparation
     }
 
     func install(_ task: Task<Void, Never>, generation: UInt64) {
@@ -379,8 +513,12 @@ private final class BootstrapCoordinator: Sendable {
     func finish(
         generation: UInt64,
         result: Result<Void, any Error>
-    ) {
-        let waiters: [Waiter]? = lock.withLock { storage in
+    ) -> [Waiter]? {
+        let completion: (
+            state: Bootstrap.State,
+            waiters: [Waiter],
+            stateUpdates: [AsyncStream<Bootstrap.State>.Continuation]
+        )? = lock.withLock { storage in
             guard storage.generation == generation else { return nil }
 
             storage.state = switch result {
@@ -388,18 +526,26 @@ private final class BootstrapCoordinator: Sendable {
                 .ready
             case .failure(let error) where error is CancellationError:
                 .cancelled
-            case .failure:
-                .failed
+            case .failure(let error):
+                .failed(Bootstrap.Failure(error))
             }
             storage.result = result
             storage.task = nil
 
             let waiters = Array(storage.waiters.values)
             storage.waiters.removeAll()
-            return waiters
+            return (
+                storage.state,
+                waiters,
+                Array(storage.stateUpdates.values)
+            )
         }
 
-        waiters?.forEach { $0.resume(with: result) }
+        guard let completion else { return nil }
+        completion.stateUpdates.forEach {
+            $0.yield(completion.state)
+        }
+        return completion.waiters
     }
 
     func addWaiter(id: UUID, continuation: Waiter) {
@@ -425,15 +571,21 @@ private final class BootstrapCoordinator: Sendable {
     }
 
     func cancel() -> Cancellation {
-        lock.withLock { storage in
+        let (cancellation, stateUpdates): (
+            Cancellation,
+            [AsyncStream<Bootstrap.State>.Continuation]
+        ) = lock.withLock { storage in
             guard storage.state == .idle || storage.state == .booting else {
-                return Cancellation(
-                    generation: storage.generation == 0
-                        ? nil
-                        : storage.generation,
-                    task: nil,
-                    context: storage.context,
-                    waiters: []
+                return (
+                    Cancellation(
+                        generation: storage.generation == 0
+                            ? nil
+                            : storage.generation,
+                        task: nil,
+                        context: storage.context,
+                        waiters: []
+                    ),
+                    []
                 )
             }
 
@@ -453,7 +605,56 @@ private final class BootstrapCoordinator: Sendable {
             storage.task = nil
             storage.context = nil
             storage.waiters.removeAll()
-            return cancellation
+            return (cancellation, Array(storage.stateUpdates.values))
+        }
+        stateUpdates.forEach { $0.yield(.cancelled) }
+        return cancellation
+    }
+
+    func isCurrent(generation: UInt64) -> Bool {
+        lock.withLock {
+            $0.generation == generation && $0.result == nil
+        }
+    }
+
+    func makeStateUpdates() -> AsyncStream<Bootstrap.State> {
+        let subscriptionID = UUID()
+        let (stream, continuation) = AsyncStream.makeStream(
+            of: Bootstrap.State.self,
+            bufferingPolicy: .unbounded
+        )
+        continuation.onTermination = { [weak self] _ in
+            self?.removeStateUpdates(subscriptionID)
+        }
+
+        let shouldFinish = lock.withLock { storage in
+            guard !storage.stateUpdatesFinished else { return true }
+            storage.stateUpdates[subscriptionID] = continuation
+            if case .terminated = continuation.yield(storage.state) {
+                storage.stateUpdates.removeValue(forKey: subscriptionID)
+            }
+            return false
+        }
+
+        if shouldFinish {
+            continuation.finish()
+        }
+        return stream
+    }
+
+    func finishStateUpdates() {
+        let stateUpdates = lock.withLock { storage in
+            storage.stateUpdatesFinished = true
+            let stateUpdates = Array(storage.stateUpdates.values)
+            storage.stateUpdates.removeAll()
+            return stateUpdates
+        }
+        stateUpdates.forEach { $0.finish() }
+    }
+
+    private func removeStateUpdates(_ id: UUID) {
+        _ = lock.withLock { storage in
+            storage.stateUpdates.removeValue(forKey: id)
         }
     }
 }

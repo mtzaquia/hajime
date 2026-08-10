@@ -263,7 +263,10 @@ struct NonBlockingTests {
         await #expect(throws: NonBlockingFailure.self) {
             try await bootstrap.run()
         }
-        #expect(bootstrap.state == .failed)
+        guard case .failed = bootstrap.state else {
+            Issue.record("Expected boot to fail")
+            return
+        }
     }
 
     @Test("Budget expiry releases readiness without restarting the step")

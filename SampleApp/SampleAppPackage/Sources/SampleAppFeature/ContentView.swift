@@ -218,7 +218,6 @@ private final class BootLab {
     ]
     private(set) var events: [LabEvent] = []
     private(set) var measurements: [BootInstrumentation.Measurement] = []
-    private(set) var isRunning = false
     private(set) var hasRun = false
 
     private var startedAt: ContinuousClock.Instant?
@@ -232,6 +231,10 @@ private final class BootLab {
         bootstrap = makeBootstrap()
     }
 
+    var isRunning: Bool {
+        bootstrap?.state == .booting
+    }
+
     func step(_ id: StepID) -> LabStep {
         steps[id]!
     }
@@ -239,7 +242,6 @@ private final class BootLab {
     func run() {
         reset()
         runAttempt &+= 1
-        isRunning = true
         hasRun = true
         startedAt = .now
         append("Boot started", kind: .plan)
@@ -259,7 +261,6 @@ private final class BootLab {
                 append("Plan failed: \(type(of: error))", kind: .failure)
             }
 
-            isRunning = false
             runTask = nil
         }
     }
@@ -269,7 +270,6 @@ private final class BootLab {
         bootstrap?.cancel()
         runTask?.cancel()
         runTask = nil
-        isRunning = false
         hasRun = false
         events = []
         measurements = []
