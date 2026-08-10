@@ -1,9 +1,9 @@
 # 🚦 Hajime
 
+[![Tests](https://github.com/mtzaquia/hajime/actions/workflows/tests.yml/badge.svg)](https://github.com/mtzaquia/hajime/actions/workflows/tests.yml)
 [![Swift 6.3](https://img.shields.io/badge/Swift-6.3-orange.svg)](https://www.swift.org/)
 [![iOS 17+](https://img.shields.io/badge/iOS-17%2B-blue.svg)](Package.swift)
 [![macOS 14+](https://img.shields.io/badge/macOS-14%2B-blue.svg)](Package.swift)
-[![Tests](https://github.com/mtzaquia/hajime/actions/workflows/tests.yml/badge.svg)](https://github.com/mtzaquia/hajime/actions/workflows/tests.yml)
 
 `Hajime` is a Swift app-boot orchestration library built around an explicit
 readiness graph.
