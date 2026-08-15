@@ -5,6 +5,8 @@
 [![iOS 17+](https://img.shields.io/badge/iOS-17%2B-blue.svg)](Package.swift)
 ![Class C](https://img.shields.io/badge/class-C-orange)
 
+<a href="https://www.buymeacoffee.com/mtzaquia" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee" style="height: 30px !important;" ></a>
+
 `Hajime` is an app-boot orchestration library built around an explicit
 readiness graph.
 
