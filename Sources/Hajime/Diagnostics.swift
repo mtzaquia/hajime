@@ -65,7 +65,7 @@ enum HajimeLogTrace {
     @TaskLocal static var id: String?
 
     static func withNewID<Result>(
-        _ operation: () async throws -> Result
+        _ operation: nonisolated(nonsending) () async throws -> Result
     ) async rethrows -> Result {
 #if DEBUG
         let id = String(UUID().uuidString.prefix(8))
