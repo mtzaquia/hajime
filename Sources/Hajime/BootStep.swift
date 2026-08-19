@@ -32,6 +32,7 @@ public struct BootStep: Sendable {
     let operation: @isolated(any) @Sendable () async throws -> Void
     var waitRequirements: [BootWaitRequirement]
     var readiness: BootStepReadiness
+    var progressID: BootProgress.ID?
 
     /// Creates a named boot step from an asynchronous operation.
     ///
@@ -55,6 +56,7 @@ public struct BootStep: Sendable {
         self.operation = operation
         waitRequirements = []
         readiness = .required
+        progressID = nil
     }
 
     /// Extends this step until a signal resolves successfully.

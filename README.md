@@ -17,6 +17,7 @@ source order, and let one application-owned `Bootstrap` coordinate readiness.
 - Start independent work together inside explicit `Parallel` groups.
 - Release readiness immediately or after a budget while selected work continues.
 - Suspend deep links and other consumers until the active run is ready.
+- Stream every reached step phase into app-owned progress presentation.
 - Bridge delegate callbacks and profile the complete boot without ad hoc tasks.
 
 ```swift
@@ -123,6 +124,8 @@ suspend on that shared contract instead of reconstructing boot state.
   subplans, select priorities, and understand failure propagation.
 - [Readiness](docs/readiness.md) — start, replace, await, observe, and cancel the
   application boot pipe, including direct SwiftUI rendering.
+- [Boot progress](docs/progress.md) — stream running, continuing, and terminal
+  step phases into app-owned presentation.
 - [Non-blocking work](docs/non-blocking-work.md) — let individual steps outlive
   readiness immediately or after a budget.
 - [Signals](docs/signals.md) — bridge delegate and service callbacks into boot
@@ -136,8 +139,8 @@ suspend on that shared contract instead of reconstructing boot state.
 
 Open [`SampleApp/SampleApp.xcworkspace`](SampleApp/SampleApp.xcworkspace) and run
 the **SampleApp** scheme. The deterministic boot lab makes sequential work,
-parallel overlap, readiness release, observed lifecycle state, and performance
-measurements visible in one timeline.
+parallel overlap, streamed step progress, readiness release, observed lifecycle
+state, and performance measurements visible in one timeline.
 
 ## License
 

@@ -182,5 +182,5 @@ later `start()` begins a fresh run. Releasing the application-owned `Bootstrap`
 also requests cancellation of its current readiness chain and outstanding
 steps.
 
-Next: [Non-blocking work](non-blocking-work.md) · [Signals](signals.md) ·
-[Diagnostics](diagnostics.md)
+Next: [Boot progress](progress.md) · [Non-blocking work](non-blocking-work.md) ·
+[Signals](signals.md) · [Diagnostics](diagnostics.md)

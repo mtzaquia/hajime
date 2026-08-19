@@ -182,11 +182,11 @@ public struct ContentView: View {
 @MainActor
 private final class BootLab {
     enum StepID: String, CaseIterable, Sendable {
-        case foundation
-        case session
-        case flags
-        case cache
-        case routing
+        case foundation = "configure-foundation"
+        case session = "restore-session"
+        case flags = "load-feature-flags"
+        case cache = "warm-disk-cache"
+        case routing = "prepare-routing"
     }
 
     private(set) var steps: [StepID: LabStep] = [
@@ -222,8 +222,8 @@ private final class BootLab {
 
     private var startedAt: ContinuousClock.Instant?
     private var runTask: Task<Void, Never>?
+    private var progressTask: Task<Void, Never>?
     private var bootstrap: Bootstrap?
-    private var runGeneration = 0
     private var runAttempt: UInt64 = 0
 
     init() {
@@ -247,6 +247,13 @@ private final class BootLab {
         append("Boot started", kind: .plan)
 
         guard let bootstrap else { return }
+        let progress = bootstrap.progress
+        progressTask = Task { [weak self] in
+            for await step in progress {
+                guard let self else { return }
+                record(step)
+            }
+        }
         bootstrap.start()
 
         runTask = Task { [weak self] in
@@ -266,10 +273,11 @@ private final class BootLab {
     }
 
     func reset() {
-        runGeneration &+= 1
         bootstrap?.cancel()
         runTask?.cancel()
+        progressTask?.cancel()
         runTask = nil
+        progressTask = nil
         hasRun = false
         events = []
         measurements = []
@@ -289,55 +297,73 @@ private final class BootLab {
                 }
             }
         ) {
-            BootStep("configure-foundation") { @MainActor [weak self] in
-                try await self?.perform(.foundation, for: .milliseconds(600))
+            BootStep("configure-foundation") {
+                try await Task.sleep(for: .milliseconds(600))
             }
 
             Parallel {
-                BootStep("restore-session") { @MainActor [weak self] in
-                    try await self?.perform(.session, for: .milliseconds(1_200))
+                BootStep("restore-session") {
+                    try await Task.sleep(for: .milliseconds(1_200))
                 }
-                BootStep("load-feature-flags") { @MainActor [weak self] in
-                    try await self?.perform(.flags, for: .milliseconds(800))
+                BootStep("load-feature-flags") {
+                    try await Task.sleep(for: .milliseconds(800))
                 }
             }
 
             BootStep(
                 "warm-disk-cache",
                 priority: .utility
-            ) { @MainActor [weak self] in
-                try await self?.perform(.cache, for: .seconds(2))
+            ) {
+                try await Task.sleep(for: .seconds(2))
             }
             .nonBlocking(after: .milliseconds(300))
 
-            BootStep("prepare-routing") { @MainActor [weak self] in
-                try await self?.perform(.routing, for: .milliseconds(500))
+            BootStep("prepare-routing") {
+                try await Task.sleep(for: .milliseconds(500))
             }
         }
+    }
+
+    private func record(_ progress: BootProgress) {
+        guard hasRun,
+              progress.attempt == runAttempt,
+              let id = StepID(rawValue: progress.name)
+        else { return }
+
+        let state: LabStep.State
+        let message: String
+        let kind: LabEvent.Kind
+        switch progress.phase {
+        case .running:
+            state = .running
+            message = "\(step(id).title) started"
+            kind = .started
+        case .continuing:
+            state = .continuing
+            message = "\(step(id).title) released readiness"
+            kind = .plan
+        case .succeeded:
+            state = .completed
+            message = "\(step(id).title) completed"
+            kind = .completed
+        case .failed(let failure):
+            state = .failed
+            message = "\(step(id).title) failed: \(failure.errorType)"
+            kind = .failure
+        case .cancelled:
+            state = .cancelled
+            message = "\(step(id).title) cancelled"
+            kind = .plan
+        }
+
+        steps[id]?.state = state
+        append(message, kind: kind)
     }
 
     private func record(_ measurement: BootInstrumentation.Measurement) {
         guard hasRun, measurement.attempt == runAttempt else { return }
         measurements.append(measurement)
         measurements.sort { $0.startOffset < $1.startOffset }
-    }
-
-    private func perform(_ id: StepID, for duration: Duration) async throws {
-        let generation = runGeneration
-        steps[id]?.state = .running
-        append("\(step(id).title) started", kind: .started)
-
-        do {
-            try await Task.sleep(for: duration)
-            guard generation == runGeneration else { return }
-            steps[id]?.state = .completed
-            append("\(step(id).title) completed", kind: .completed)
-        } catch {
-            if generation == runGeneration {
-                steps[id]?.state = .pending
-            }
-            throw error
-        }
     }
 
     private func append(_ message: String, kind: LabEvent.Kind) {
@@ -425,16 +451,22 @@ private extension TaskPriority {
 }
 
 private struct LabStep: Identifiable {
-    enum State {
+    enum State: Equatable {
         case pending
         case running
+        case continuing
         case completed
+        case failed
+        case cancelled
 
         var title: String {
             switch self {
             case .pending: "Pending"
             case .running: "Running"
+            case .continuing: "Continuing"
             case .completed: "Complete"
+            case .failed: "Failed"
+            case .cancelled: "Cancelled"
             }
         }
 
@@ -442,7 +474,10 @@ private struct LabStep: Identifiable {
             switch self {
             case .pending: "circle.dashed"
             case .running: "arrow.trianglehead.2.clockwise.rotate.90"
+            case .continuing: "arrow.turn.up.right"
             case .completed: "checkmark.circle.fill"
+            case .failed: "xmark.octagon.fill"
+            case .cancelled: "slash.circle.fill"
             }
         }
 
@@ -450,7 +485,10 @@ private struct LabStep: Identifiable {
             switch self {
             case .pending: .secondary
             case .running: .orange
+            case .continuing: .teal
             case .completed: .green
+            case .failed: .red
+            case .cancelled: .secondary
             }
         }
     }

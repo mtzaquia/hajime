@@ -10,8 +10,9 @@ The app is a focused orchestration lab for Hajime's boot DSL:
   `start()`, and awaits `waitUntilReady()` while a foundation step, two service
   steps inside `Parallel`, a utility-priority cache warmup that releases
   readiness after 0.3 seconds, and a final routing step execute.
-- The running presentation reads the observable `Bootstrap.state` directly;
-  it does not maintain a second app-owned lifecycle flag.
+- The running presentation reads the observable `Bootstrap.state` directly and
+  consumes `Bootstrap.progress` to project step phases into its rows and
+  timeline. Boot operations contain no sample-owned presentation mutations.
 - **Inspect execution** presents start and completion events with elapsed times,
   making sequential ordering, explicit parallel overlap, readiness, and the
   still-running non-blocking step visible without relying on console output.

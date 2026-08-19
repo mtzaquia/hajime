@@ -160,6 +160,10 @@ fileprivate indirect enum BootPlanNode: Sendable {
 }
 
 extension BootPlan {
+    func assigningProgressIDs() -> BootPlan {
+        BootPlan(nodes: nodes.map { $0.assigningProgressIDs() })
+    }
+
     var stepCount: Int {
         nodes.reduce(0) { $0 + $1.stepCount }
     }
@@ -206,6 +210,18 @@ func executeConcurrently<Element: Sendable>(
 }
 
 private extension BootPlanNode {
+    func assigningProgressIDs() -> BootPlanNode {
+        switch self {
+        case .step(var step):
+            step.progressID = BootProgress.ID()
+            return .step(step)
+        case .sequence(let nodes):
+            return .sequence(nodes.map { $0.assigningProgressIDs() })
+        case .parallel(let nodes):
+            return .parallel(nodes.map { $0.assigningProgressIDs() })
+        }
+    }
+
     var signalBindings: [any BootSignalBinding] {
         switch self {
         case .step(let step):

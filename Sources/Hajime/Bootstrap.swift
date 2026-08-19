@@ -112,7 +112,7 @@ public final class Bootstrap: Observable, Sendable {
         instrumentation: BootInstrumentation = .automatic,
         @BootPlanBuilder _ content: () -> BootPlan
     ) {
-        let plan = content()
+        let plan = content().assigningProgressIDs()
         self.plan = plan
         signalBindings = plan.signalBindings
         self.name = name
@@ -131,6 +131,7 @@ public final class Bootstrap: Observable, Sendable {
         instrumentation: BootInstrumentation = .automatic,
         plan: BootPlan
     ) {
+        let plan = plan.assigningProgressIDs()
         self.plan = plan
         signalBindings = plan.signalBindings
         self.name = name
@@ -140,6 +141,7 @@ public final class Bootstrap: Observable, Sendable {
     deinit {
         cancelExecution(observingState: false)
         coordinator.finishStateUpdates()
+        coordinator.finishProgressUpdates()
     }
 
     /// The lifecycle state of the current execution.
@@ -171,6 +173,27 @@ public final class Bootstrap: Observable, Sendable {
         coordinator.makeStateUpdates()
     }
 
+    /// A stream of phase changes for the boot steps reached by this coordinator.
+    ///
+    /// Each access creates an independent subscription. A subscriber joining an
+    /// active or completed execution first receives the latest phase of every
+    /// step already reached in that attempt, ordered by first execution. It then
+    /// receives every later phase change, including work that continues after
+    /// releasing readiness. Steps not yet reached do not emit a value.
+    ///
+    /// Starting again increments ``BootProgress/attempt`` and begins a new set
+    /// of progress values. Step IDs remain stable across attempts, allowing a
+    /// consumer to replace its locally retained value for each step. Progress
+    /// from work superseded by a replacement execution is discarded.
+    ///
+    /// Cancelling a task iterating the stream removes only that subscription and
+    /// does not cancel application boot. The stream is nonthrowing; failures are
+    /// emitted through ``BootProgress/Phase/failed(_:)`` and the bootstrap's
+    /// overall outcome remains available through ``state`` or ``stateUpdates``.
+    public var progress: AsyncStream<BootProgress> {
+        coordinator.makeProgressUpdates()
+    }
+
     /// Whether the current execution completed successfully.
     ///
     /// This observable snapshot is intended for presentation and diagnostics.
@@ -186,6 +209,10 @@ public final class Bootstrap: Observable, Sendable {
 
     var stateUpdateSubscriberCount: Int {
         coordinator.stateUpdateSubscriberCount
+    }
+
+    var progressSubscriberCount: Int {
+        coordinator.progressSubscriberCount
     }
 
     /// Starts the boot plan and supersedes any current execution.
@@ -431,6 +458,12 @@ private final class BootstrapCoordinator: Sendable {
             UUID: AsyncStream<Bootstrap.State>.Continuation
         ] = [:]
         var stateUpdatesFinished = false
+        var progressOrder: [BootProgress.ID] = []
+        var latestProgress: [BootProgress.ID: BootProgress] = [:]
+        var progressUpdates: [
+            UUID: AsyncStream<BootProgress>.Continuation
+        ] = [:]
+        var progressUpdatesFinished = false
     }
 
     private let lock = OSAllocatedUnfairLock(initialState: Storage())
@@ -458,11 +491,26 @@ private final class BootstrapCoordinator: Sendable {
         lock.withLock { $0.stateUpdates.count }
     }
 
+    var progressSubscriberCount: Int {
+        lock.withLock { $0.progressUpdates.count }
+    }
+
     func prepareForStart(
         name: String,
         instrumentation: BootInstrumentation
     ) -> Preparation {
-        let (preparation, stateUpdates) = lock.withLock { storage in
+        let progressHandler: @Sendable (UInt64, BootProgress) -> Void = {
+            [weak self] generation, progress in
+            self?.publishProgress(progress, generation: generation)
+        }
+        let (
+            preparation,
+            stateUpdates,
+            cancelledProgress,
+            progressUpdates
+        ) = lock.withLock { storage in
+            let cancelledProgress = cancelActiveProgress(storage: &storage)
+            let progressUpdates = Array(storage.progressUpdates.values)
             let supersededGeneration = storage.generation == 0
                 ? nil
                 : storage.generation
@@ -471,12 +519,17 @@ private final class BootstrapCoordinator: Sendable {
             let supersededTask = storage.task
             let supersededContext = storage.context
             let context = BootExecutionContext(
+                generation: storage.generation,
+                attempt: storage.attempt,
+                progressHandler: progressHandler,
                 instrumentation: BootRunInstrumentation(
                     bootstrap: name,
                     attempt: storage.attempt,
                     configuration: instrumentation
                 )
             )
+            storage.progressOrder.removeAll(keepingCapacity: true)
+            storage.latestProgress.removeAll(keepingCapacity: true)
             storage.state = .booting
             storage.result = nil
             storage.task = nil
@@ -489,8 +542,13 @@ private final class BootstrapCoordinator: Sendable {
                     supersededContext: supersededContext,
                     context: context
                 ),
-                Array(storage.stateUpdates.values)
+                Array(storage.stateUpdates.values),
+                cancelledProgress,
+                progressUpdates
             )
+        }
+        for progress in cancelledProgress {
+            progressUpdates.forEach { $0.yield(progress) }
         }
         stateUpdates.forEach { $0.yield(.booting) }
         return preparation
@@ -571,10 +629,14 @@ private final class BootstrapCoordinator: Sendable {
     }
 
     func cancel() -> Cancellation {
-        let (cancellation, stateUpdates): (
+        let (cancellation, stateUpdates, cancelledProgress, progressUpdates): (
             Cancellation,
-            [AsyncStream<Bootstrap.State>.Continuation]
+            [AsyncStream<Bootstrap.State>.Continuation],
+            [BootProgress],
+            [AsyncStream<BootProgress>.Continuation]
         ) = lock.withLock { storage in
+            let cancelledProgress = cancelActiveProgress(storage: &storage)
+            let progressUpdates = Array(storage.progressUpdates.values)
             guard storage.state == .idle || storage.state == .booting else {
                 return (
                     Cancellation(
@@ -585,7 +647,9 @@ private final class BootstrapCoordinator: Sendable {
                         context: storage.context,
                         waiters: []
                     ),
-                    []
+                    [],
+                    cancelledProgress,
+                    progressUpdates
                 )
             }
 
@@ -605,7 +669,15 @@ private final class BootstrapCoordinator: Sendable {
             storage.task = nil
             storage.context = nil
             storage.waiters.removeAll()
-            return (cancellation, Array(storage.stateUpdates.values))
+            return (
+                cancellation,
+                Array(storage.stateUpdates.values),
+                cancelledProgress,
+                progressUpdates
+            )
+        }
+        for progress in cancelledProgress {
+            progressUpdates.forEach { $0.yield(progress) }
         }
         stateUpdates.forEach { $0.yield(.cancelled) }
         return cancellation
@@ -652,9 +724,88 @@ private final class BootstrapCoordinator: Sendable {
         stateUpdates.forEach { $0.finish() }
     }
 
+    func makeProgressUpdates() -> AsyncStream<BootProgress> {
+        let subscriptionID = UUID()
+        let (stream, continuation) = AsyncStream.makeStream(
+            of: BootProgress.self,
+            bufferingPolicy: .unbounded
+        )
+        continuation.onTermination = { [weak self] _ in
+            self?.removeProgressUpdates(subscriptionID)
+        }
+
+        let shouldFinish = lock.withLock { storage in
+            guard !storage.progressUpdatesFinished else { return true }
+            storage.progressUpdates[subscriptionID] = continuation
+            for id in storage.progressOrder {
+                guard let progress = storage.latestProgress[id] else { continue }
+                if case .terminated = continuation.yield(progress) {
+                    storage.progressUpdates.removeValue(forKey: subscriptionID)
+                    break
+                }
+            }
+            return false
+        }
+
+        if shouldFinish {
+            continuation.finish()
+        }
+        return stream
+    }
+
+    func finishProgressUpdates() {
+        let progressUpdates = lock.withLock { storage in
+            storage.progressUpdatesFinished = true
+            let progressUpdates = Array(storage.progressUpdates.values)
+            storage.progressUpdates.removeAll()
+            return progressUpdates
+        }
+        progressUpdates.forEach { $0.finish() }
+    }
+
     private func removeStateUpdates(_ id: UUID) {
         _ = lock.withLock { storage in
             storage.stateUpdates.removeValue(forKey: id)
+        }
+    }
+
+    private func publishProgress(
+        _ progress: BootProgress,
+        generation: UInt64
+    ) {
+        let progressUpdates: [AsyncStream<BootProgress>.Continuation] =
+            lock.withLock { storage in
+                guard storage.generation == generation else { return [] }
+                if storage.latestProgress[progress.id]?.phase.isActive == false {
+                    return []
+                }
+
+                if storage.latestProgress[progress.id] == nil {
+                    storage.progressOrder.append(progress.id)
+                }
+                storage.latestProgress[progress.id] = progress
+                return Array(storage.progressUpdates.values)
+            }
+        progressUpdates.forEach { $0.yield(progress) }
+    }
+
+    private func cancelActiveProgress(
+        storage: inout Storage
+    ) -> [BootProgress] {
+        storage.progressOrder.compactMap { id in
+            guard let progress = storage.latestProgress[id],
+                  progress.phase.isActive
+            else { return nil }
+
+            let cancelled = progress.changingPhase(to: .cancelled)
+            storage.latestProgress[id] = cancelled
+            return cancelled
+        }
+    }
+
+    private func removeProgressUpdates(_ id: UUID) {
+        _ = lock.withLock { storage in
+            storage.progressUpdates.removeValue(forKey: id)
         }
     }
 }
@@ -669,9 +820,20 @@ final class BootExecutionContext: Sendable {
     }
 
     private let lock = OSAllocatedUnfairLock(initialState: Storage())
+    private let generation: UInt64
+    private let attempt: UInt64
+    private let progressHandler: @Sendable (UInt64, BootProgress) -> Void
     let instrumentation: BootRunInstrumentation
 
-    init(instrumentation: BootRunInstrumentation) {
+    init(
+        generation: UInt64,
+        attempt: UInt64,
+        progressHandler: @escaping @Sendable (UInt64, BootProgress) -> Void,
+        instrumentation: BootRunInstrumentation
+    ) {
+        self.generation = generation
+        self.attempt = attempt
+        self.progressHandler = progressHandler
         self.instrumentation = instrumentation
     }
 
@@ -698,6 +860,7 @@ final class BootExecutionContext: Sendable {
                 step: step.name,
                 priority: step.priority
             )
+            report(step, phase: .continuing)
             hajimeLog.hajimeDebug(
                 .stepBecameNonBlocking(name: step.name, after: nil)
             )
@@ -755,6 +918,7 @@ final class BootExecutionContext: Sendable {
                 step: step.name,
                 priority: step.priority
             )
+            report(step, phase: .continuing)
             hajimeLog.hajimeDebug(
                 .stepBecameNonBlocking(
                     name: step.name,
@@ -774,7 +938,8 @@ final class BootExecutionContext: Sendable {
         for step: BootStep,
         race: BootStepReadinessRace? = nil
     ) -> Task<StepResult, Never> {
-        Task(priority: step.priority) { [self] in
+        report(step, phase: .running)
+        return Task(priority: step.priority) { [self] in
             let result = await executeWork(of: step)
             race?.resolve(.completed(result))
             return result
@@ -804,10 +969,34 @@ final class BootExecutionContext: Sendable {
                     throw error
                 }
             }
+            report(step, phase: .succeeded)
             return .success(())
         } catch {
+            if error is CancellationError {
+                report(step, phase: .cancelled)
+            } else {
+                report(
+                    step,
+                    phase: .failed(Bootstrap.Failure(error))
+                )
+            }
             return .failure(error)
         }
+    }
+
+    private func report(_ step: BootStep, phase: BootProgress.Phase) {
+        guard let id = step.progressID else {
+            preconditionFailure("A boot step executed without progress identity")
+        }
+        progressHandler(
+            generation,
+            BootProgress(
+                id: id,
+                attempt: attempt,
+                name: step.name,
+                phase: phase
+            )
+        )
     }
 
     private func adopt(
