@@ -773,20 +773,29 @@ private final class BootstrapCoordinator: Sendable {
         _ progress: BootProgress,
         generation: UInt64
     ) {
-        let progressUpdates: [AsyncStream<BootProgress>.Continuation] =
-            lock.withLock { storage in
-                guard storage.generation == generation else { return [] }
-                if storage.latestProgress[progress.id]?.phase.isActive == false {
-                    return []
-                }
-
-                if storage.latestProgress[progress.id] == nil {
-                    storage.progressOrder.append(progress.id)
-                }
-                storage.latestProgress[progress.id] = progress
-                return Array(storage.progressUpdates.values)
+        lock.withLock { storage in
+            guard storage.generation == generation else { return }
+            if storage.latestProgress[progress.id]?.phase.isActive == false {
+                return
             }
-        progressUpdates.forEach { $0.yield(progress) }
+
+            if storage.latestProgress[progress.id] == nil {
+                storage.progressOrder.append(progress.id)
+            }
+            storage.latestProgress[progress.id] = progress
+
+            let terminatedSubscriptions = storage.progressUpdates.compactMap {
+                id, continuation in
+                if case .terminated = continuation.yield(progress) {
+                    id
+                } else {
+                    nil
+                }
+            }
+            for id in terminatedSubscriptions {
+                storage.progressUpdates.removeValue(forKey: id)
+            }
+        }
     }
 
     private func cancelActiveProgress(

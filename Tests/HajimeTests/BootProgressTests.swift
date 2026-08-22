@@ -146,6 +146,42 @@ struct BootProgressTests {
         assertSucceeded(succeeded.phase)
     }
 
+    @Test("Concurrent progress never regresses a terminal phase")
+    func preservesConcurrentPublicationOrder() async throws {
+        let stepCount = 500
+        var bootstrap: Bootstrap? = Bootstrap {
+            for index in 0..<stepCount {
+                BootStep("background-\(index)") {
+                    await Task.yield()
+                }
+                .nonBlocking()
+            }
+        }
+        let progress = bootstrap!.progress
+
+        try await bootstrap!.run()
+        while bootstrap!.hasOutstandingNonBlockingSteps {
+            await Task.yield()
+        }
+        bootstrap = nil
+
+        var terminalSteps: Set<BootProgress.ID> = []
+        for await update in progress {
+            switch update.phase {
+            case .running, .continuing:
+                if terminalSteps.contains(update.id) {
+                    Issue.record(
+                        "Received an active phase after \(update.name) terminated"
+                    )
+                }
+            case .succeeded, .failed, .cancelled:
+                terminalSteps.insert(update.id)
+            }
+        }
+
+        #expect(terminalSteps.count == stepCount)
+    }
+
     @Test("A non-blocking failure emits after readiness remains ready")
     func emitsContainedFailureAfterReadiness() async throws {
         let signal = BootSignal<Void>("release-failure")
