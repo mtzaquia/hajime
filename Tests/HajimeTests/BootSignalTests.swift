@@ -49,7 +49,7 @@ struct BootSignalTests {
         let waiter = Task {
             try await signal.wait()
         }
-        await waitForWaiters(1, on: signal)
+        try await waitForWaiters(1, on: signal)
 
         signal.succeed("registered")
 
@@ -57,7 +57,7 @@ struct BootSignalTests {
     }
 
     @Test("Failure is buffered before the first waiter")
-    func buffersEarlyFailure() async {
+    func buffersEarlyFailure() async throws {
         let signal = BootSignal<Int>("remote-configuration")
 
         signal.fail(SignalFailure.expected)
@@ -71,12 +71,12 @@ struct BootSignalTests {
     }
 
     @Test("A late failure resumes its waiter")
-    func deliversLateFailure() async {
+    func deliversLateFailure() async throws {
         let signal = BootSignal<Int>("push-registration")
         let waiter = Task {
             try await signal.wait()
         }
-        await waitForWaiters(1, on: signal)
+        try await waitForWaiters(1, on: signal)
 
         signal.fail(SignalFailure.expected)
 
@@ -93,7 +93,7 @@ struct BootSignalTests {
                 try await signal.wait()
             }
         }
-        await waitForWaiters(waiters.count, on: signal)
+        try await waitForWaiters(waiters.count, on: signal)
 
         signal.succeed(7)
 
@@ -111,14 +111,14 @@ struct BootSignalTests {
         let survivingWaiter = Task {
             try await signal.wait()
         }
-        await waitForWaiters(2, on: signal)
+        try await waitForWaiters(2, on: signal)
 
         cancelledWaiter.cancel()
 
         await #expect(throws: CancellationError.self) {
             try await cancelledWaiter.value
         }
-        await waitForWaiters(1, on: signal)
+        try await waitForWaiters(1, on: signal)
 
         signal.succeed(9)
 
@@ -138,7 +138,7 @@ struct BootSignalTests {
     }
 
     @Test("The first failure wins over duplicate resolutions")
-    func keepsFirstFailedResolution() async {
+    func keepsFirstFailedResolution() async throws {
         let signal = BootSignal<Int>("push-registration")
 
         signal.fail(SignalFailure.expected)
@@ -169,7 +169,7 @@ struct BootSignalTests {
     }
 
     @Test("Resolve accepts a failed Result")
-    func resolvesFailedResult() async {
+    func resolvesFailedResult() async throws {
         let signal = BootSignal<Int>("remote-configuration")
 
         signal.resolve(Result<Int, SignalFailure>.failure(.expected))
@@ -203,13 +203,13 @@ struct BootSignalTests {
         }
 
         bootstrap.start()
-        await waitForWaiters(1, on: signal)
+        try await waitForWaiters(1, on: signal)
         bootstrap.cancel()
 
         await #expect(throws: CancellationError.self) {
             try await bootstrap.waitUntilReady()
         }
-        await waitForWaiters(0, on: signal)
+        try await waitForWaiters(0, on: signal)
 
         signal.succeed()
         await #expect(throws: CancellationError.self) {
@@ -217,7 +217,7 @@ struct BootSignalTests {
         }
 
         bootstrap.start()
-        await waitForWaiters(1, on: signal)
+        try await waitForWaiters(1, on: signal)
         signal.succeed()
         try await bootstrap.waitUntilReady()
         try await signal.wait()
@@ -236,8 +236,10 @@ struct BootSignalTests {
     private func waitForWaiters<Value: Sendable>(
         _ count: Int,
         on signal: BootSignal<Value>
-    ) async {
+    ) async throws {
+        let deadline = TestDeadline("signal.pendingWaiterCount != count")
         while signal.pendingWaiterCount != count {
+            try deadline.check()
             await Task.yield()
         }
     }

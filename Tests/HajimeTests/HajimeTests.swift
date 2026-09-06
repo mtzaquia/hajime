@@ -46,22 +46,18 @@ private actor ExecutionTrace {
 
 private actor PriorityProbe {
     private var recordedPriority: TaskPriority?
-    private var continuation: CheckedContinuation<TaskPriority, Never>?
 
     func record(_ priority: TaskPriority) {
         recordedPriority = priority
-        continuation?.resume(returning: priority)
-        continuation = nil
     }
 
-    func next() async -> TaskPriority {
-        if let recordedPriority {
-            return recordedPriority
+    func next() async throws -> TaskPriority {
+        let deadline = TestDeadline("recordedPriority == nil")
+        while recordedPriority == nil {
+            try deadline.check()
+            await Task.yield()
         }
-
-        return await withCheckedContinuation { continuation in
-            self.continuation = continuation
-        }
+        return try #require(recordedPriority)
     }
 }
 
@@ -288,7 +284,7 @@ struct BootPlanDSLTests {
             try await bootstrap.run()
         }
 
-        let recordedPriority = await probe.next()
+        let recordedPriority = try await probe.next()
         try await runTask.value
         return recordedPriority
     }

@@ -64,8 +64,10 @@ private actor InstrumentationCancellationProbe {
         try await Task.sleep(for: .seconds(10))
     }
 
-    func waitUntilStarted() async {
+    func waitUntilStarted() async throws {
+        let deadline = TestDeadline("!started")
         while !started {
+            try deadline.check()
             await Task.yield()
         }
     }
@@ -76,18 +78,22 @@ private actor InstrumentationReplacementProbe {
     private var firstStarted = false
     private var mayFinishFirst = false
 
-    func execute() async {
+    func execute() async throws {
         executionCount += 1
         guard executionCount == 1 else { return }
 
         firstStarted = true
+        let deadline = TestDeadline("!mayFinishFirst")
         while !mayFinishFirst {
+            try deadline.check()
             await Task.yield()
         }
     }
 
-    func waitUntilFirstStarted() async {
+    func waitUntilFirstStarted() async throws {
+        let deadline = TestDeadline("!firstStarted")
         while !firstStarted {
+            try deadline.check()
             await Task.yield()
         }
     }
@@ -177,7 +183,9 @@ struct BootInstrumentationTests {
         }
 
         bootstrap.start()
+        let deadline = TestDeadline("signal.pendingWaiterCount == 0")
         while signal.pendingWaiterCount == 0 {
+            try deadline.check()
             await Task.yield()
         }
         try await bootstrap.waitUntilReady()
@@ -237,12 +245,12 @@ struct BootInstrumentationTests {
             instrumentation: .measurements(recorder.record)
         ) {
             BootStep("configuration") {
-                await probe.execute()
+                try await probe.execute()
             }
         }
 
         bootstrap.start()
-        await probe.waitUntilFirstStarted()
+        try await probe.waitUntilFirstStarted()
         bootstrap.start()
         try await Task.sleep(for: .milliseconds(10))
         await probe.finishFirst()
@@ -322,7 +330,7 @@ struct BootInstrumentationTests {
     }
 
     @Test("Failures expose only the concrete error type")
-    func redactsFailureDetails() async {
+    func redactsFailureDetails() async throws {
         let recorder = MeasurementRecorder()
         let bootstrap = Bootstrap(
             instrumentation: .measurements(recorder.record)
@@ -350,7 +358,7 @@ struct BootInstrumentationTests {
     }
 
     @Test("Cancellation is classified consistently at every active boundary")
-    func classifiesCancellation() async {
+    func classifiesCancellation() async throws {
         let recorder = MeasurementRecorder()
         let probe = InstrumentationCancellationProbe()
         let bootstrap = Bootstrap(
@@ -362,7 +370,7 @@ struct BootInstrumentationTests {
         }
 
         bootstrap.start()
-        await probe.waitUntilStarted()
+        try await probe.waitUntilStarted()
         bootstrap.cancel()
 
         await #expect(throws: CancellationError.self) {

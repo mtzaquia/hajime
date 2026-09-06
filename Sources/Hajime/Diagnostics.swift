@@ -27,7 +27,7 @@ import os
 public enum Hajime {
     /// The amount of boot-orchestration detail emitted in debug builds.
     public enum DebugLogLevel: Equatable, Sendable {
-        /// Emits no Hajime diagnostics.
+        /// Disables optional lifecycle logs while retaining configuration warnings.
         case off
 
         /// Logs boot, step, readiness-release, and signal lifecycle outcomes.
@@ -45,7 +45,8 @@ public enum Hajime {
     /// Logging is ``DebugLogLevel/off`` by default, and reads and writes are safe
     /// from concurrent tasks. Each boot execution receives a trace identifier
     /// inherited by its steps. Diagnostic calls are compiled out when the
-    /// Hajime module is built without `DEBUG`.
+    /// Hajime module is built without `DEBUG`. Signal-configuration warnings
+    /// remain enabled at every level and in release builds.
     ///
     /// ```swift
     /// Hajime.debug = .trace

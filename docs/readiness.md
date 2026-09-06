@@ -178,7 +178,8 @@ the shared execution. By contrast, cancelling a standalone
 Call `cancel()` to explicitly end the current execution and resume all waiters
 with `CancellationError`. After readiness, `cancel()` preserves the ready state
 while still requesting cancellation of outstanding non-blocking steps. A
-later `start()` begins a fresh run. Releasing the application-owned `Bootstrap`
+later `start()` begins a fresh run after the cancelled readiness chain finishes
+cooperative teardown. Releasing the application-owned `Bootstrap`
 also requests cancellation of its current readiness chain and outstanding
 steps.
 

@@ -1,8 +1,9 @@
 # Diagnostics
 
 Hajime provides opt-in lifecycle logging for inspecting a boot plan without
-changing its execution. Diagnostics are off by default and are compiled out of
-non-debug Hajime builds.
+changing its execution. Optional lifecycle logs are off by default and are
+compiled out of non-debug Hajime builds. Signal-configuration warnings remain
+enabled at every log level, including in release builds.
 
 Enable logging once at the application composition root:
 
@@ -19,7 +20,7 @@ tasks.
 
 | Level | Events |
 | --- | --- |
-| `.off` | Nothing. This is the default. |
+| `.off` | No optional lifecycle logs. Configuration warnings remain enabled. This is the default. |
 | `.normal` | Boot, step, readiness-release, and signal waits, completions, cancellations, and failures. |
 | `.trace` | Everything in `.normal`, plus parallel boundaries, signal arming and rearming, buffered-result replay, and duplicate resolution. |
 

@@ -38,7 +38,9 @@ private actor StepTrace {
         events.append("\(name)-started")
 
         do {
+            let deadline = TestDeadline("!isReleased")
             while !isReleased {
+                try deadline.check()
                 try await Task.sleep(for: .milliseconds(1))
             }
             events.append("\(name)-finished")
@@ -49,14 +51,18 @@ private actor StepTrace {
         }
     }
 
-    func waitForEvent(_ event: String) async {
+    func waitForEvent(_ event: String) async throws {
+        let deadline = TestDeadline("!events.contains(event)")
         while !events.contains(event) {
+            try deadline.check()
             await Task.yield()
         }
     }
 
-    func waitForCancellation() async {
+    func waitForCancellation() async throws {
+        let deadline = TestDeadline("cancellationCount == 0")
         while cancellationCount == 0 {
+            try deadline.check()
             await Task.yield()
         }
     }
@@ -68,24 +74,25 @@ private actor StepTrace {
 
 private actor StepPriorityProbe {
     private var priority: TaskPriority?
-    private var continuation: CheckedContinuation<TaskPriority, Never>?
     private var hasStarted = false
     private var isReleased = false
 
-    func holdAndRecordPriority() async {
+    func holdAndRecordPriority() async throws {
         hasStarted = true
+        let deadline = TestDeadline("!isReleased")
         while !isReleased {
+            try deadline.check()
             await Task.yield()
         }
 
         let priority = Task.currentPriority
         self.priority = priority
-        continuation?.resume(returning: priority)
-        continuation = nil
     }
 
-    func waitUntilStarted() async {
+    func waitUntilStarted() async throws {
+        let deadline = TestDeadline("!hasStarted")
         while !hasStarted {
+            try deadline.check()
             await Task.yield()
         }
     }
@@ -94,14 +101,13 @@ private actor StepPriorityProbe {
         isReleased = true
     }
 
-    func waitForPriority() async -> TaskPriority {
-        if let priority {
-            return priority
+    func waitForPriority() async throws -> TaskPriority {
+        let deadline = TestDeadline("priority == nil")
+        while priority == nil {
+            try deadline.check()
+            await Task.yield()
         }
-
-        return await withCheckedContinuation { continuation in
-            self.continuation = continuation
-        }
+        return try #require(priority)
     }
 }
 
@@ -113,7 +119,7 @@ private actor ReplacementStepProbe {
     private(set) var maximumActiveCount = 0
     private(set) var observedCancellation = false
 
-    func execute() async {
+    func execute() async throws {
         executionCount += 1
         let execution = executionCount
         activeCount += 1
@@ -121,7 +127,9 @@ private actor ReplacementStepProbe {
         defer { activeCount -= 1 }
 
         guard execution == 1 else { return }
+        let deadline = TestDeadline("!releaseFirstExecution")
         while !releaseFirstExecution {
+            try deadline.check()
             if Task.isCancelled {
                 observedCancellation = true
             }
@@ -129,10 +137,12 @@ private actor ReplacementStepProbe {
         }
     }
 
-    func waitForCurrentExecution() async {
+    func waitForCurrentExecution() async throws {
         expectedStartCount += 1
         let count = expectedStartCount
+        let deadline = TestDeadline("executionCount < count")
         while executionCount < count {
+            try deadline.check()
             await Task.yield()
         }
     }
@@ -141,8 +151,10 @@ private actor ReplacementStepProbe {
         releaseFirstExecution = true
     }
 
-    func waitUntilInactive() async {
+    func waitUntilInactive() async throws {
+        let deadline = TestDeadline("activeCount > 0")
         while activeCount > 0 {
+            try deadline.check()
             await Task.yield()
         }
     }
@@ -169,7 +181,7 @@ struct NonBlockingTests {
             .nonBlocking()
 
             BootStep("prepare-routing") {
-                await trace.waitForEvent("warm-cache-started")
+                try await trace.waitForEvent("warm-cache-started")
                 await trace.append("ready-chain-finished")
             }
         }
@@ -184,7 +196,7 @@ struct NonBlockingTests {
         #expect(bootstrap.hasOutstandingNonBlockingSteps)
 
         await trace.release()
-        await waitForNonBlockingStepsToFinish(on: bootstrap)
+        try await waitForNonBlockingStepsToFinish(on: bootstrap)
         #expect(await trace.executionCount == 1)
         #expect(await trace.events.last == "warm-cache-finished")
     }
@@ -204,7 +216,7 @@ struct NonBlockingTests {
         #expect(bootstrap.state == .ready)
 
         signal.succeed()
-        await waitForNonBlockingStepsToFinish(on: bootstrap)
+        try await waitForNonBlockingStepsToFinish(on: bootstrap)
         #expect(bootstrap.state == .ready)
     }
 
@@ -213,20 +225,20 @@ struct NonBlockingTests {
         let probe = StepPriorityProbe()
         let bootstrap = Bootstrap {
             BootStep("warm-cache", priority: .utility) {
-                await probe.holdAndRecordPriority()
+                try await probe.holdAndRecordPriority()
             }
             .nonBlocking()
         }
 
         bootstrap.start()
-        await probe.waitUntilStarted()
+        try await probe.waitUntilStarted()
         try await bootstrap.waitUntilReady()
         for _ in 0..<10 {
             await Task.yield()
         }
         await probe.release()
-        let priority = await probe.waitForPriority()
-        await waitForNonBlockingStepsToFinish(on: bootstrap)
+        let priority = try await probe.waitForPriority()
+        try await waitForNonBlockingStepsToFinish(on: bootstrap)
 
         #expect(priority == .utility)
     }
@@ -252,7 +264,7 @@ struct NonBlockingTests {
     }
 
     @Test("Failure before the budget still fails boot")
-    func propagatesFailureBeforeBudget() async {
+    func propagatesFailureBeforeBudget() async throws {
         let bootstrap = Bootstrap {
             BootStep("configuration") {
                 throw NonBlockingFailure.expected
@@ -290,7 +302,7 @@ struct NonBlockingTests {
         #expect(await trace.events == ["restore-content-started", "routing"])
 
         await trace.release()
-        await waitForNonBlockingStepsToFinish(on: bootstrap)
+        try await waitForNonBlockingStepsToFinish(on: bootstrap)
         #expect(await trace.executionCount == 1)
         #expect(await trace.events.last == "restore-content-finished")
     }
@@ -310,7 +322,7 @@ struct NonBlockingTests {
         #expect(bootstrap.state == .ready)
 
         signal.succeed()
-        await waitForNonBlockingStepsToFinish(on: bootstrap)
+        try await waitForNonBlockingStepsToFinish(on: bootstrap)
         #expect(bootstrap.state == .ready)
     }
 
@@ -340,7 +352,7 @@ struct NonBlockingTests {
             let bootstrap = Bootstrap { step }
 
             bootstrap.start()
-            await waitForWaiters(1, on: signal)
+            try await waitForWaiters(1, on: signal)
             #expect(bootstrap.state == .booting)
             signal.succeed(42)
             try await bootstrap.waitUntilReady()
@@ -369,13 +381,13 @@ struct NonBlockingTests {
             let bootstrap = Bootstrap { step }
 
             bootstrap.start()
-            await waitForWaiters(1, on: signal)
+            try await waitForWaiters(1, on: signal)
             try await bootstrap.waitUntilReady()
             #expect(await trace.events == ["operation"])
 
             signal.succeed(42)
-            await trace.waitForEvent("handler-42")
-            await waitForNonBlockingStepsToFinish(on: bootstrap)
+            try await trace.waitForEvent("handler-42")
+            try await waitForNonBlockingStepsToFinish(on: bootstrap)
             results.append(await trace.events)
         }
 
@@ -395,12 +407,12 @@ struct NonBlockingTests {
         }
 
         bootstrap.start()
-        await waitForWaiters(1, on: signal)
+        try await waitForWaiters(1, on: signal)
         try await bootstrap.waitUntilReady()
         bootstrap.cancel()
 
-        await waitForWaiters(0, on: signal)
-        await waitForNonBlockingStepsToFinish(on: bootstrap)
+        try await waitForWaiters(0, on: signal)
+        try await waitForNonBlockingStepsToFinish(on: bootstrap)
         #expect(bootstrap.state == .ready)
     }
 
@@ -416,7 +428,7 @@ struct NonBlockingTests {
 
         try await bootstrap?.run()
         bootstrap = nil
-        await trace.waitForCancellation()
+        try await trace.waitForCancellation()
 
         #expect(await trace.events.contains("warm-cache-cancelled"))
     }
@@ -426,12 +438,12 @@ struct NonBlockingTests {
         let probe = ReplacementStepProbe()
         let bootstrap = Bootstrap {
             BootStep("warm-cache") {
-                await probe.execute()
+                try await probe.execute()
             }
             .nonBlocking()
 
             BootStep("routing") {
-                await probe.waitForCurrentExecution()
+                try await probe.waitForCurrentExecution()
             }
         }
 
@@ -444,7 +456,7 @@ struct NonBlockingTests {
         #expect(await probe.maximumActiveCount == 2)
 
         await probe.releaseFirst()
-        await probe.waitUntilInactive()
+        try await probe.waitUntilInactive()
     }
 
     private func configuredStep(
@@ -476,16 +488,20 @@ struct NonBlockingTests {
     private func waitForWaiters<Value: Sendable>(
         _ count: Int,
         on signal: BootSignal<Value>
-    ) async {
+    ) async throws {
+        let deadline = TestDeadline("signal.pendingWaiterCount != count")
         while signal.pendingWaiterCount != count {
+            try deadline.check()
             await Task.yield()
         }
     }
 
     private func waitForNonBlockingStepsToFinish(
         on bootstrap: Bootstrap
-    ) async {
+    ) async throws {
+        let deadline = TestDeadline("bootstrap.hasOutstandingNonBlockingSteps")
         while bootstrap.hasOutstandingNonBlockingSteps {
+            try deadline.check()
             await Task.yield()
         }
     }

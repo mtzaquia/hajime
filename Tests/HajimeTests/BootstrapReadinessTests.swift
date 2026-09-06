@@ -37,7 +37,9 @@ private actor BootSuspensionProbe {
         defer { activeCount -= 1 }
 
         do {
+            let deadline = TestDeadline("!isReleased")
             while !isReleased {
+                try deadline.check()
                 try await Task.sleep(for: .milliseconds(1))
             }
         } catch is CancellationError {
@@ -46,14 +48,18 @@ private actor BootSuspensionProbe {
         }
     }
 
-    func waitForStarts(_ expectedCount: Int) async {
+    func waitForStarts(_ expectedCount: Int) async throws {
+        let deadline = TestDeadline("startCount < expectedCount")
         while startCount < expectedCount {
+            try deadline.check()
             await Task.yield()
         }
     }
 
-    func waitForCancellations(_ expectedCount: Int) async {
+    func waitForCancellations(_ expectedCount: Int) async throws {
+        let deadline = TestDeadline("cancellationCount < expectedCount")
         while cancellationCount < expectedCount {
+            try deadline.check()
             await Task.yield()
         }
     }
@@ -61,6 +67,28 @@ private actor BootSuspensionProbe {
     func release() {
         isReleased = true
     }
+}
+
+private actor RequiredTeardownProbe {
+    private(set) var starts = 0
+    private(set) var maximumActiveCount = 0
+    private var activeCount = 0
+    private var mayFinish = false
+
+    func execute() async throws {
+        starts += 1
+        activeCount += 1
+        maximumActiveCount = max(maximumActiveCount, activeCount)
+        defer { activeCount -= 1 }
+        // Deliberately retain the operation during cooperative teardown.
+        let deadline = TestDeadline("required operation has not been released")
+        while !mayFinish {
+            try deadline.check()
+            await Task.yield()
+        }
+    }
+
+    func release() { mayFinish = true }
 }
 
 private enum ReadinessFailure: Error {
@@ -85,7 +113,7 @@ struct BootstrapReadinessTests {
             try await bootstrap.waitUntilReady()
         }
         bootstrap.start()
-        await probe.waitForStarts(1)
+        try await probe.waitForStarts(1)
 
         #expect(bootstrap.state == .booting)
         #expect(!bootstrap.isReady)
@@ -107,7 +135,7 @@ struct BootstrapReadinessTests {
         }
 
         bootstrap.start()
-        await probe.waitForStarts(1)
+        try await probe.waitForStarts(1)
 
         let waiters = (0..<20).map { _ in
             Task {
@@ -136,10 +164,10 @@ struct BootstrapReadinessTests {
         }
 
         bootstrap.start()
-        await probe.waitForStarts(1)
+        try await probe.waitForStarts(1)
         bootstrap.start()
-        await probe.waitForStarts(2)
-        await probe.waitForCancellations(1)
+        try await probe.waitForStarts(2)
+        try await probe.waitForCancellations(1)
 
         #expect(bootstrap.state == .booting)
 
@@ -185,7 +213,7 @@ struct BootstrapReadinessTests {
         }
 
         bootstrap.start()
-        await probe.waitForStarts(1)
+        try await probe.waitForStarts(1)
 
         let waiter = Task {
             try await bootstrap.waitUntilReady()
@@ -204,7 +232,7 @@ struct BootstrapReadinessTests {
     }
 
     @Test("A failure is observable through state and every waiter")
-    func propagatesBootFailure() async {
+    func propagatesBootFailure() async throws {
         let bootstrap = Bootstrap {
             BootStep("failing") {
                 throw ReadinessFailure.expected
@@ -242,7 +270,7 @@ struct BootstrapReadinessTests {
     }
 
     @Test("Explicit cancellation ends the pipe and its waiters")
-    func cancelsExecutionAndWaiters() async {
+    func cancelsExecutionAndWaiters() async throws {
         let probe = BootSuspensionProbe()
         let bootstrap = Bootstrap {
             BootStep("suspended") {
@@ -251,7 +279,7 @@ struct BootstrapReadinessTests {
         }
 
         bootstrap.start()
-        await probe.waitForStarts(1)
+        try await probe.waitForStarts(1)
         let waiter = Task {
             try await bootstrap.waitUntilReady()
         }
@@ -261,13 +289,13 @@ struct BootstrapReadinessTests {
         await #expect(throws: CancellationError.self) {
             try await waiter.value
         }
-        await probe.waitForCancellations(1)
+        try await probe.waitForCancellations(1)
         #expect(bootstrap.state == .cancelled)
         #expect(!bootstrap.isReady)
     }
 
     @Test("Cancelling run cancels the shared execution")
-    func runOwnsExecutionCancellation() async {
+    func runOwnsExecutionCancellation() async throws {
         let probe = BootSuspensionProbe()
         let bootstrap = Bootstrap {
             BootStep("suspended") {
@@ -278,13 +306,55 @@ struct BootstrapReadinessTests {
             try await bootstrap.run()
         }
 
-        await probe.waitForStarts(1)
+        try await probe.waitForStarts(1)
         run.cancel()
 
         await #expect(throws: CancellationError.self) {
             try await run.value
         }
-        await probe.waitForCancellations(1)
+        try await probe.waitForCancellations(1)
         #expect(bootstrap.state == .cancelled)
     }
+    @Test("Cancellation followed by restart still awaits required teardown")
+    func serializesRestartAfterCancellation() async throws {
+        let probe = RequiredTeardownProbe()
+        let bootstrap = Bootstrap(instrumentation: .disabled) {
+            BootStep("required") { try await probe.execute() }
+        }
+        defer { bootstrap.cancel() }
+        bootstrap.start()
+        let deadline = TestDeadline("required operation has not started")
+        while await probe.starts == 0 {
+            try deadline.check()
+            await Task.yield()
+        }
+        bootstrap.cancel()
+        bootstrap.cancel() // Repeated cancellation must retain the dependency.
+        bootstrap.start()
+        // Give a wrongly detached replacement an opportunity to enter the gate.
+        try await Task.sleep(for: .milliseconds(50))
+        await probe.release()
+        try await bootstrap.waitUntilReady()
+        #expect(await probe.starts == 2)
+        #expect(await probe.maximumActiveCount == 1)
+    }
+
+    @Test("Already-cancelled waiters reject cached readiness outcomes",
+          arguments: [false, true])
+    func cancelsWaiterBeforeReplayingResult(fails: Bool) async {
+        let bootstrap = Bootstrap(instrumentation: .disabled) {
+            BootStep("outcome") {
+                if fails { throw ReadinessFailure.expected }
+            }
+        }
+        _ = try? await bootstrap.run()
+        let waiter = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            try await bootstrap.waitUntilReady()
+        }
+        await #expect(throws: CancellationError.self) {
+            try await waiter.value
+        }
+    }
+
 }

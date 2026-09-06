@@ -34,7 +34,9 @@ private actor ObservedBootProbe {
         startCount += 1
 
         do {
+            let deadline = TestDeadline("!isReleased")
             while !isReleased {
+                try deadline.check()
                 try await Task.sleep(for: .milliseconds(1))
             }
         } catch is CancellationError {
@@ -43,14 +45,18 @@ private actor ObservedBootProbe {
         }
     }
 
-    func waitForStarts(_ count: Int) async {
+    func waitForStarts(_ count: Int) async throws {
+        let deadline = TestDeadline("startCount < count")
         while startCount < count {
+            try deadline.check()
             await Task.yield()
         }
     }
 
-    func waitForCancellations(_ count: Int) async {
+    func waitForCancellations(_ count: Int) async throws {
+        let deadline = TestDeadline("cancellationCount < count")
         while cancellationCount < count {
+            try deadline.check()
             await Task.yield()
         }
     }
@@ -115,7 +121,7 @@ struct BootstrapObservationTests {
         }
 
         bootstrap.start()
-        await probe.waitForStarts(1)
+        try await probe.waitForStarts(1)
 
         #expect(started.withLock { $0 })
         #expect(alsoStarted.withLock { $0 })
@@ -163,7 +169,7 @@ struct BootstrapObservationTests {
     }
 
     @Test("A failure reaches observation, the stream, and every waiter")
-    func propagatesFailureEverywhere() async {
+    func propagatesFailureEverywhere() async throws {
         let signal = BootSignal<Void>("release-failure")
         let bootstrap = Bootstrap {
             BootStep("failing") {}
@@ -176,7 +182,9 @@ struct BootstrapObservationTests {
 
         bootstrap.start()
         #expect(await states.next() == .booting)
+        let deadline = TestDeadline("signal.pendingWaiterCount == 0")
         while signal.pendingWaiterCount == 0 {
+            try deadline.check()
             await Task.yield()
         }
 
@@ -271,7 +279,7 @@ struct BootstrapObservationTests {
     }
 
     @Test("Explicit cancellation reaches the lifecycle and waiters")
-    func emitsCancellation() async {
+    func emitsCancellation() async throws {
         let probe = ObservedBootProbe()
         let bootstrap = Bootstrap {
             BootStep("suspended") {
@@ -283,7 +291,7 @@ struct BootstrapObservationTests {
 
         bootstrap.start()
         #expect(await states.next() == .booting)
-        await probe.waitForStarts(1)
+        try await probe.waitForStarts(1)
         let waiter = Task {
             try await bootstrap.waitUntilReady()
         }
@@ -310,10 +318,10 @@ struct BootstrapObservationTests {
         let updates = bootstrap.stateUpdates
 
         bootstrap.start()
-        await probe.waitForStarts(1)
+        try await probe.waitForStarts(1)
         bootstrap.start()
-        await probe.waitForCancellations(1)
-        await probe.waitForStarts(2)
+        try await probe.waitForCancellations(1)
+        try await probe.waitForStarts(2)
         await probe.release()
         try await bootstrap.waitUntilReady()
 
@@ -360,12 +368,12 @@ struct BootstrapObservationTests {
             for await _ in bootstrap.stateUpdates {}
         }
 
-        await waitForSubscribers(1, on: bootstrap)
+        try await waitForSubscribers(1, on: bootstrap)
         bootstrap.start()
-        await probe.waitForStarts(1)
+        try await probe.waitForStarts(1)
         subscriber.cancel()
         await subscriber.value
-        await waitForSubscribers(0, on: bootstrap)
+        try await waitForSubscribers(0, on: bootstrap)
 
         #expect(bootstrap.state == .booting)
         await probe.release()
@@ -373,7 +381,7 @@ struct BootstrapObservationTests {
     }
 
     @Test("A lifecycle stream does not retain its bootstrap")
-    func finishesWithCancellationOnBootstrapRelease() async {
+    func finishesWithCancellationOnBootstrapRelease() async throws {
         var bootstrap: Bootstrap? = Bootstrap {
             BootStep("complete") {}
         }
@@ -408,7 +416,9 @@ struct BootstrapObservationTests {
 
         bootstrap.start()
         try await bootstrap.waitUntilReady()
+        let deadline = TestDeadline("weakFailure != nil")
         while weakFailure != nil {
+            try deadline.check()
             await Task.yield()
         }
 
@@ -435,8 +445,10 @@ struct BootstrapObservationTests {
     private func waitForSubscribers(
         _ count: Int,
         on bootstrap: Bootstrap
-    ) async {
+    ) async throws {
+        let deadline = TestDeadline("bootstrap.stateUpdateSubscriberCount != count")
         while bootstrap.stateUpdateSubscriberCount != count {
+            try deadline.check()
             await Task.yield()
         }
     }

@@ -122,7 +122,7 @@ public struct BootStep: Sendable {
     /// Hajime waits for both signals concurrently after running the step's
     /// operation, then invokes `completion` once with both resolved values. The
     /// step completes only after that operation returns. Any signal or completion
-    /// failure fails the step.
+    /// failure fails the step and cancels unresolved sibling signal waits.
     ///
     /// - Parameters:
     ///   - first: The first callback bridge to await.
@@ -138,17 +138,15 @@ public struct BootStep: Sendable {
             BootWaitRequirement(
                 signals: [first, second]
             ) { step, instrumentation in
-                async let firstValue = BootWaitRequirement.wait(
-                    for: first,
-                    step: step,
-                    instrumentation: instrumentation
-                )
-                async let secondValue = BootWaitRequirement.wait(
-                    for: second,
-                    step: step,
-                    instrumentation: instrumentation
-                )
-                let values = try await (firstValue, secondValue)
+                let values = try await waitTogether {
+                    try await BootWaitRequirement.wait(
+                        for: first, step: step, instrumentation: instrumentation
+                    )
+                } second: {
+                    try await BootWaitRequirement.wait(
+                        for: second, step: step, instrumentation: instrumentation
+                    )
+                }
                 try await BootWaitRequirement.handle(
                     signals: [first.diagnosticName, second.diagnosticName],
                     step: step,
@@ -165,7 +163,7 @@ public struct BootStep: Sendable {
     /// Hajime waits for all signals concurrently after running the step's
     /// operation, then invokes `completion` once with their resolved values. The
     /// step completes only after that operation returns. Any signal or completion
-    /// failure fails the step.
+    /// failure fails the step and cancels unresolved sibling signal waits.
     ///
     /// - Parameters:
     ///   - first: The first callback bridge to await.
@@ -187,26 +185,21 @@ public struct BootStep: Sendable {
             BootWaitRequirement(
                 signals: [first, second, third]
             ) { step, instrumentation in
-                async let firstValue = BootWaitRequirement.wait(
-                    for: first,
-                    step: step,
-                    instrumentation: instrumentation
-                )
-                async let secondValue = BootWaitRequirement.wait(
-                    for: second,
-                    step: step,
-                    instrumentation: instrumentation
-                )
-                async let thirdValue = BootWaitRequirement.wait(
-                    for: third,
-                    step: step,
-                    instrumentation: instrumentation
-                )
-                let values = try await (
-                    firstValue,
-                    secondValue,
-                    thirdValue
-                )
+                let values = try await waitTogether {
+                    try await BootWaitRequirement.wait(
+                        for: first, step: step, instrumentation: instrumentation
+                    )
+                } second: {
+                    try await waitTogether {
+                        try await BootWaitRequirement.wait(
+                            for: second, step: step, instrumentation: instrumentation
+                        )
+                    } second: {
+                        try await BootWaitRequirement.wait(
+                            for: third, step: step, instrumentation: instrumentation
+                        )
+                    }
+                }
                 try await BootWaitRequirement.handle(
                     signals: [
                         first.diagnosticName,
@@ -216,7 +209,7 @@ public struct BootStep: Sendable {
                     step: step,
                     instrumentation: instrumentation
                 ) {
-                    try await completion(values.0, values.1, values.2)
+                    try await completion(values.0, values.1.0, values.1.1)
                 }
             }
         )
@@ -348,5 +341,36 @@ struct BootWaitRequirement: Sendable {
         ) {
             try await operation()
         }
+    }
+}
+
+private enum BootWaitValue<First: Sendable, Second: Sendable>: Sendable {
+    case first(First)
+    case second(Second)
+}
+
+/// Collects heterogeneous results in completion order so either failure cancels
+/// the other wait, even when the first declared signal has not resolved.
+private func waitTogether<First: Sendable, Second: Sendable>(
+    _ first: @escaping @Sendable () async throws -> First,
+    second: @escaping @Sendable () async throws -> Second
+) async throws -> (First, Second) {
+    try await withThrowingTaskGroup(of: BootWaitValue<First, Second>.self) { group in
+        group.addTask { .first(try await first()) }
+        group.addTask { .second(try await second()) }
+        defer { group.cancelAll() }
+
+        var firstValue: First?
+        var secondValue: Second?
+        for try await value in group {
+            switch value {
+            case .first(let value): firstValue = value
+            case .second(let value): secondValue = value
+            }
+        }
+        guard let firstValue, let secondValue else {
+            preconditionFailure("Both signal waits must produce a value")
+        }
+        return (firstValue, secondValue)
     }
 }

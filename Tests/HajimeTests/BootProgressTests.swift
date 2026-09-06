@@ -31,7 +31,9 @@ private actor ProgressProbe {
     func hold() async throws {
         startCount += 1
         do {
+            let deadline = TestDeadline("!mayFinish")
             while !mayFinish {
+                try deadline.check()
                 try await Task.sleep(for: .milliseconds(1))
             }
         } catch is CancellationError {
@@ -40,14 +42,18 @@ private actor ProgressProbe {
         }
     }
 
-    func waitForStarts(_ count: Int) async {
+    func waitForStarts(_ count: Int) async throws {
+        let deadline = TestDeadline("startCount < count")
         while startCount < count {
+            try deadline.check()
             await Task.yield()
         }
     }
 
-    func waitForCancellations(_ count: Int) async {
+    func waitForCancellations(_ count: Int) async throws {
+        let deadline = TestDeadline("cancellationCount < count")
         while cancellationCount < count {
+            try deadline.check()
             await Task.yield()
         }
     }
@@ -137,7 +143,9 @@ struct BootProgressTests {
         assertContinuing(continuing.phase)
 
         await probe.finish()
+        let deadline = TestDeadline("bootstrap.hasOutstandingNonBlockingSteps")
         while bootstrap.hasOutstandingNonBlockingSteps {
+            try deadline.check()
             await Task.yield()
         }
 
@@ -160,7 +168,9 @@ struct BootProgressTests {
         let progress = bootstrap!.progress
 
         try await bootstrap!.run()
+        let deadline = TestDeadline("bootstrap!.hasOutstandingNonBlockingSteps")
         while bootstrap!.hasOutstandingNonBlockingSteps {
+            try deadline.check()
             await Task.yield()
         }
         bootstrap = nil
@@ -223,7 +233,7 @@ struct BootProgressTests {
         var progress = bootstrap.progress.makeAsyncIterator()
 
         bootstrap.start()
-        await probe.waitForStarts(1)
+        try await probe.waitForStarts(1)
         bootstrap.cancel()
 
         let running = try #require(await progress.next())
@@ -299,10 +309,10 @@ struct BootProgressTests {
         var progress = bootstrap.progress.makeAsyncIterator()
 
         bootstrap.start()
-        await probe.waitForStarts(1)
+        try await probe.waitForStarts(1)
         bootstrap.start()
-        await probe.waitForCancellations(1)
-        await probe.waitForStarts(2)
+        try await probe.waitForCancellations(1)
+        try await probe.waitForStarts(2)
         await probe.finish()
         try await bootstrap.waitUntilReady()
 
@@ -358,7 +368,7 @@ struct BootProgressTests {
         var progress = bootstrap!.progress.makeAsyncIterator()
 
         bootstrap!.start()
-        await probe.waitForStarts(1)
+        try await probe.waitForStarts(1)
         let running = try #require(await progress.next())
         assertRunning(running.phase)
 

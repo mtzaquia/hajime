@@ -163,7 +163,9 @@ BootStep("register-system-services") {
 }
 ```
 
-The grouped handler runs once after every supplied signal succeeds.
+The grouped handler runs once after every supplied signal succeeds. A failure
+in any supplied signal cancels the other unresolved waits and fails the step,
+regardless of argument order.
 
 ## Retry with the same signal instances
 

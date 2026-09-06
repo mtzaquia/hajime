@@ -245,6 +245,8 @@ public final class Bootstrap: Observable, Sendable {
     ///   `CancellationError` when either the execution or this waiting task is
     ///   cancelled.
     public func waitUntilReady() async throws {
+        try Task.checkCancellation()
+
         let waiterID = UUID()
 
         try await withTaskCancellationHandler {
@@ -269,7 +271,8 @@ public final class Bootstrap: Observable, Sendable {
     /// the coordinator to ``State/cancelled``. After readiness, the ready state
     /// remains unchanged while outstanding non-blocking steps receive
     /// cancellation. Boot-step cancellation remains cooperative. Calling
-    /// ``start()`` afterward begins a new execution.
+    /// ``start()`` afterward begins a new execution after the cancelled readiness
+    /// chain finishes cooperative teardown.
     public func cancel() {
         let changedState = lifecycleLock.withLock {
             cancelExecution()
@@ -666,7 +669,8 @@ private final class BootstrapCoordinator: Sendable {
                 context: storage.context,
                 waiters: Array(storage.waiters.values)
             )
-            storage.task = nil
+            // Keep the cancelled readiness chain so a later start awaits its
+            // cooperative teardown before executing the replacement plan.
             storage.context = nil
             storage.waiters.removeAll()
             return (

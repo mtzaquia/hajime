@@ -31,16 +31,20 @@ private actor WaitingTrace {
         events.append(event)
     }
 
-    func holdHandler() async {
+    func holdHandler() async throws {
         events.append("handler-started")
+        let deadline = TestDeadline("!isHandlerReleased")
         while !isHandlerReleased {
+            try deadline.check()
             await Task.yield()
         }
         events.append("handler-finished")
     }
 
-    func waitForEvent(_ event: String) async {
+    func waitForEvent(_ event: String) async throws {
+        let deadline = TestDeadline("!events.contains(event)")
         while !events.contains(event) {
+            try deadline.check()
             await Task.yield()
         }
     }
@@ -67,16 +71,16 @@ struct BootStepWaitingTests {
             }
             .waiting(for: signal) { value in
                 #expect(value == 42)
-                await trace.holdHandler()
+                try await trace.holdHandler()
             }
         }
 
         bootstrap.start()
-        await waitForWaiters(1, on: signal)
+        try await waitForWaiters(1, on: signal)
         #expect(bootstrap.state == .booting)
 
         signal.succeed(42)
-        await trace.waitForEvent("handler-started")
+        try await trace.waitForEvent("handler-started")
         #expect(bootstrap.state == .booting)
 
         await trace.releaseHandler()
@@ -90,7 +94,7 @@ struct BootStepWaitingTests {
     }
 
     @Test("A signal failure skips its handler and fails the step")
-    func propagatesSignalFailure() async {
+    func propagatesSignalFailure() async throws {
         let signal = BootSignal<Int>("push-registration")
         let trace = WaitingTrace()
         let bootstrap = Bootstrap {
@@ -101,7 +105,7 @@ struct BootStepWaitingTests {
         }
 
         bootstrap.start()
-        await waitForWaiters(1, on: signal)
+        try await waitForWaiters(1, on: signal)
         signal.fail(WaitingFailure.signal)
 
         await #expect(throws: WaitingFailure.self) {
@@ -115,7 +119,7 @@ struct BootStepWaitingTests {
     }
 
     @Test("A signal handler failure fails the step")
-    func propagatesHandlerFailure() async {
+    func propagatesHandlerFailure() async throws {
         let signal = BootSignal<Int>("push-registration")
         let bootstrap = Bootstrap {
             BootStep("register-push") {}
@@ -125,7 +129,7 @@ struct BootStepWaitingTests {
         }
 
         bootstrap.start()
-        await waitForWaiters(1, on: signal)
+        try await waitForWaiters(1, on: signal)
         signal.succeed(1)
 
         await #expect(throws: WaitingFailure.self) {
@@ -149,11 +153,11 @@ struct BootStepWaitingTests {
         }
 
         bootstrap.start()
-        await waitForWaiters(1, on: push)
-        await waitForWaiters(1, on: attestation)
+        try await waitForWaiters(1, on: push)
+        try await waitForWaiters(1, on: attestation)
 
         attestation.succeed("ready")
-        await trace.waitForEvent("attestation-ready")
+        try await trace.waitForEvent("attestation-ready")
         #expect(bootstrap.state == .booting)
 
         push.succeed(7)
@@ -165,7 +169,7 @@ struct BootStepWaitingTests {
     }
 
     @Test("A chained failure cancels sibling waits")
-    func cancelsSiblingWaitAfterFailure() async {
+    func cancelsSiblingWaitAfterFailure() async throws {
         let push = BootSignal<Int>("push-registration")
         let attestation = BootSignal<String>("app-attestation")
         let bootstrap = Bootstrap {
@@ -175,14 +179,14 @@ struct BootStepWaitingTests {
         }
 
         bootstrap.start()
-        await waitForWaiters(1, on: push)
-        await waitForWaiters(1, on: attestation)
+        try await waitForWaiters(1, on: push)
+        try await waitForWaiters(1, on: attestation)
         push.fail(WaitingFailure.signal)
 
         await #expect(throws: WaitingFailure.self) {
             try await bootstrap.waitUntilReady()
         }
-        await waitForWaiters(0, on: attestation)
+        try await waitForWaiters(0, on: attestation)
     }
 
     @Test("A grouped handler receives two values after both signals resolve")
@@ -198,8 +202,8 @@ struct BootStepWaitingTests {
         }
 
         bootstrap.start()
-        await waitForWaiters(1, on: push)
-        await waitForWaiters(1, on: attestation)
+        try await waitForWaiters(1, on: push)
+        try await waitForWaiters(1, on: attestation)
 
         push.succeed(8)
         await Task.yield()
@@ -228,9 +232,9 @@ struct BootStepWaitingTests {
         }
 
         bootstrap.start()
-        await waitForWaiters(1, on: push)
-        await waitForWaiters(1, on: attestation)
-        await waitForWaiters(1, on: migration)
+        try await waitForWaiters(1, on: push)
+        try await waitForWaiters(1, on: attestation)
+        try await waitForWaiters(1, on: migration)
         push.succeed(9)
         attestation.succeed("valid")
         migration.succeed()
@@ -251,12 +255,12 @@ struct BootStepWaitingTests {
         }
 
         bootstrap.start()
-        await waitForWaiters(1, on: signal)
+        try await waitForWaiters(1, on: signal)
         signal.succeed(1)
         try await bootstrap.waitUntilReady()
 
         bootstrap.start()
-        await waitForWaiters(1, on: signal)
+        try await waitForWaiters(1, on: signal)
         #expect(bootstrap.state == .booting)
         signal.succeed(2)
         try await bootstrap.waitUntilReady()
@@ -273,14 +277,14 @@ struct BootStepWaitingTests {
         }
 
         bootstrap.start()
-        await waitForWaiters(1, on: signal)
+        try await waitForWaiters(1, on: signal)
         signal.fail(WaitingFailure.signal)
         await #expect(throws: WaitingFailure.self) {
             try await bootstrap.waitUntilReady()
         }
 
         bootstrap.start()
-        await waitForWaiters(1, on: signal)
+        try await waitForWaiters(1, on: signal)
         signal.succeed(2)
         try await bootstrap.waitUntilReady()
         #expect(bootstrap.state == .ready)
@@ -304,7 +308,7 @@ struct BootStepWaitingTests {
     }
 
     @Test("Waiting on an undeclared signal fails instead of hanging")
-    func failsForUnregisteredSignal() async {
+    func failsForUnregisteredSignal() async throws {
         let signal = BootSignal<Int>("forgotten-signal")
         let bootstrap = Bootstrap {
             BootStep("invalid") {
@@ -334,7 +338,7 @@ struct BootStepWaitingTests {
         }
 
         first.start()
-        await waitForWaiters(1, on: signal)
+        try await waitForWaiters(1, on: signal)
         signal.succeed(1)
         try await first.waitUntilReady()
 
@@ -352,11 +356,53 @@ struct BootStepWaitingTests {
         }
     }
 
+    @Test("Grouped failures cancel unresolved siblings in every argument position",
+          arguments: [(2, 0), (2, 1), (3, 0), (3, 1), (3, 2)])
+    func propagatesGroupedFailure(configuration: (Int, Int)) async throws {
+        let (count, failingIndex) = configuration
+        let signals = (0..<count).map { BootSignal<Int>("signal-\($0)") }
+        let trace = WaitingTrace()
+        let bootstrap = Bootstrap(instrumentation: .disabled) {
+            if count == 2 {
+                BootStep("grouped") {}
+                    .waiting(for: signals[0], signals[1]) { _, _ in
+                        await trace.append("handler-called")
+                    }
+            } else {
+                BootStep("grouped") {}
+                    .waiting(for: signals[0], signals[1], signals[2]) { _, _, _ in
+                        await trace.append("handler-called")
+                    }
+            }
+        }
+        defer { bootstrap.cancel() }
+        bootstrap.start()
+        for signal in signals {
+            try await waitForWaiters(1, on: signal)
+        }
+        signals[failingIndex].fail(WaitingFailure.signal)
+
+        let deadline = TestDeadline("grouped failure has not ended boot")
+        while bootstrap.state == .booting {
+            try deadline.check()
+            await Task.yield()
+        }
+        await #expect(throws: WaitingFailure.signal) {
+            try await bootstrap.waitUntilReady()
+        }
+        #expect(await trace.events.isEmpty)
+        for signal in signals {
+            #expect(signal.pendingWaiterCount == 0)
+        }
+    }
+
     private func waitForWaiters<Value: Sendable>(
         _ count: Int,
         on signal: BootSignal<Value>
-    ) async {
+    ) async throws {
+        let deadline = TestDeadline("signal.pendingWaiterCount != count")
         while signal.pendingWaiterCount != count {
+            try deadline.check()
             await Task.yield()
         }
     }
