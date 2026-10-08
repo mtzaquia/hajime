@@ -51,7 +51,7 @@ Package Manager:
 dependencies: [
   .package(
     url: "https://github.com/mtzaquia/hajime.git",
-    from: "1.0.0"
+    from: "1.1.0"
   ),
 ]
 ```
