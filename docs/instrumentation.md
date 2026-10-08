@@ -65,7 +65,8 @@ or other suspending work directly in the callback. Hajime does not create a
 `Task` for each measurement.
 
 The callback adds to the automatic Instruments signposts. Use
-`instrumentation: .disabled` to disable both paths for a coordinator.
+`instrumentation: .disabled` to disable signposts, callbacks, and debug timing
+diagnostics for a coordinator.
 
 ## Interpret a measurement
 
@@ -111,7 +112,8 @@ Measurements and signposts include no signal values, tokens, payloads, URLs,
 error descriptions, or localized descriptions. A failure contains only its
 concrete error type.
 
-`Hajime.debug` is a separate, debug-only lifecycle facility. Leave it off while
+`Hajime.debug` enables debug-only lifecycle events and readable elapsed-time
+diagnostics from these same intervals; see [Diagnostics](diagnostics.md). Leave it off while
 collecting representative boot timings because log construction and console
 I/O can perturb the result. Performance instrumentation is available in release
 builds without enabling debug logging.

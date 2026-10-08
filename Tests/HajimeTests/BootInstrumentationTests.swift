@@ -105,6 +105,18 @@ private actor InstrumentationReplacementProbe {
 
 @Suite("Boot instrumentation")
 struct BootInstrumentationTests {
+    @Test("Lifecycle events share the instrumentation run identifier")
+    func correlatesTimingAndLifecycle() async throws {
+        let recorder = MeasurementRecorder()
+        let trace = OSAllocatedUnfairLock(initialState: String?.none)
+        let bootstrap = Bootstrap(instrumentation: .measurements(recorder.record)) {
+            BootStep("store") { trace.withLock { $0 = HajimeLogTrace.id } }
+        }
+        try await bootstrap.run()
+        let boot = try #require(recorder.measurements.first { $0.scope == .bootstrap })
+        #expect(trace.withLock { $0 } == String(boot.runID.uuidString.prefix(8)))
+    }
+
     @Test("A successful run emits every orchestration boundary")
     func emitsCanonicalSuccessfulIntervals() async throws {
         let recorder = MeasurementRecorder()

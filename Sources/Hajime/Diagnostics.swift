@@ -30,10 +30,12 @@ public enum Hajime {
         /// Disables optional lifecycle logs while retaining configuration warnings.
         case off
 
-        /// Logs boot, step, readiness-release, and signal lifecycle outcomes.
+        /// Logs boot, step, readiness-release, and signal lifecycle outcomes
+        /// with elapsed timings for readiness, scheduling, and background work.
         case normal
 
-        /// Adds parallel boundaries and detailed signal lifecycle events.
+        /// Adds operation and signal-handler timings, parallel boundaries,
+        /// and detailed signal lifecycle events.
         case trace
     }
 
@@ -66,10 +68,11 @@ enum HajimeLogTrace {
     @TaskLocal static var id: String?
 
     static func withNewID<Result>(
+        _ identifier: String? = nil,
         _ operation: nonisolated(nonsending) () async throws -> Result
     ) async rethrows -> Result {
 #if DEBUG
-        let id = String(UUID().uuidString.prefix(8))
+        let id = identifier ?? String(UUID().uuidString.prefix(8))
         return try await $id.withValue(id, operation: operation)
 #else
         return try await operation()
@@ -78,6 +81,7 @@ enum HajimeLogTrace {
 }
 
 enum HajimeLogEvent {
+    case timing(BootInstrumentation.Measurement)
     case bootStarted(
         stepCount: Int,
         parallelGroupCount: Int,
@@ -105,6 +109,8 @@ enum HajimeLogEvent {
 
     var logLevel: Hajime.DebugLogLevel {
         switch self {
+        case .timing(let measurement):
+            measurement.scope.timingLogLevel
         case .bootStarted,
              .bootSucceeded,
              .bootCancelled,
@@ -135,6 +141,11 @@ enum HajimeLogEvent {
         let trace = HajimeLogTrace.id.map { "[\($0)]" } ?? ""
 
         return switch self {
+        case .timing(let measurement):
+            "[timing][\(String(measurement.runID.uuidString.prefix(8)))] • measured | "
+                + "boot=\(measurement.bootstrap.debugDescription) attempt=\(measurement.attempt) "
+                + "\(measurement.scope.timingDescription) start=\(measurement.startOffset.hajimeDescription) "
+                + "elapsed=\(measurement.duration.hajimeDescription) outcome=\(measurement.outcome.signpostDescription)"
         case let .bootStarted(
             stepCount,
             parallelGroupCount,
@@ -254,5 +265,39 @@ private extension Duration {
         let seconds = Double(components.seconds)
             + Double(components.attoseconds) / 1e18
         return String(format: "%.3fs", seconds)
+    }
+}
+
+extension BootInstrumentation.Measurement.Scope {
+    var timingLogLevel: Hajime.DebugLogLevel {
+        switch self {
+        case .bootstrap, .scheduling, .step, .signalWait, .nonBlocking, .readinessBudget:
+            .normal
+        case .operation, .signalHandler, .parallel:
+            .trace
+        }
+    }
+
+    var timingDescription: String {
+        switch self {
+        case .bootstrap:
+            "scope=bootstrap"
+        case .scheduling:
+            "scope=scheduling"
+        case let .step(name, priority):
+            "scope=step step=\(name.debugDescription) priority=\(priority.hajimeDescription)"
+        case .operation(let step):
+            "scope=operation step=\(step.debugDescription)"
+        case let .signalWait(signal, step):
+            "scope=signal_wait step=\(step.debugDescription) signal=\(signal.debugDescription)"
+        case let .signalHandler(signals, step):
+            "scope=signal_handler step=\(step.debugDescription) signals=\(signals.map(\.debugDescription).joined(separator: ","))"
+        case .parallel:
+            "scope=parallel"
+        case .nonBlocking(let step):
+            "scope=non_blocking step=\(step.debugDescription)"
+        case .readinessBudget(let step):
+            "scope=readiness_budget step=\(step.debugDescription)"
+        }
     }
 }

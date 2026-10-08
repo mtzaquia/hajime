@@ -27,7 +27,8 @@ import os
 ///
 /// Hajime emits Instruments signposts by default in both debug and release
 /// builds. Use ``measurements(_:)`` to also forward completed intervals to an
-/// analytics or observability system, or ``disabled`` to turn both paths off.
+/// analytics or observability system. In debug builds, ``Hajime/debug`` also
+/// enables elapsed-time diagnostics. Use ``disabled`` to turn all timing paths off.
 public struct BootInstrumentation: Sendable {
     /// One completed interval from a boot execution.
     public struct Measurement: Equatable, Sendable {
@@ -110,7 +111,7 @@ public struct BootInstrumentation: Sendable {
         handler: nil
     )
 
-    /// Disables Instruments signposts and custom measurements.
+    /// Disables Instruments signposts, custom measurements, and timing diagnostics.
     public static let disabled = BootInstrumentation(
         emitsSignposts: false,
         handler: nil
@@ -160,23 +161,40 @@ final class BootRunInstrumentation: Sendable {
                 category: "Performance"
             )
             : .disabled
+        #if DEBUG
+        let diagnosticLevel = configuration.emitsSignposts || configuration.handler != nil
+            ? Hajime.debug
+            : .off
+        #else
+        let diagnosticLevel = Hajime.DebugLogLevel.off
+        #endif
+
+        guard signposter.isEnabled || configuration.handler != nil || diagnosticLevel != .off else {
+            rootSpan = nil
+            schedulingSpan = nil
+            return
+        }
+
         let descriptor = BootMeasurementDescriptor(
             bootstrap: bootstrap,
             runID: UUID(),
             attempt: attempt,
             requestInstant: ContinuousClock.now,
             signposter: signposter,
-            handler: configuration.handler
+            handler: configuration.handler,
+            diagnosticLevel: diagnosticLevel
         )
-
-        guard signposter.isEnabled || configuration.handler != nil else {
-            rootSpan = nil
-            schedulingSpan = nil
-            return
-        }
 
         rootSpan = BootSpan(scope: .bootstrap, descriptor: descriptor)
         schedulingSpan = BootSpan(scope: .scheduling, descriptor: descriptor)
+    }
+
+    var traceID: String? {
+        #if DEBUG
+        rootSpan.map { String($0.descriptor.runID.uuidString.prefix(8)) }
+        #else
+        nil
+        #endif
     }
 
     func measure<Result>(
@@ -201,6 +219,9 @@ final class BootRunInstrumentation: Sendable {
         _ scope: BootInstrumentation.Measurement.Scope
     ) -> BootSpan? {
         guard let rootSpan else { return nil }
+        let descriptor = rootSpan.descriptor
+        guard descriptor.signposter.isEnabled || descriptor.handler != nil
+            || descriptor.diagnosticLevel.includes(scope.timingLogLevel) else { return nil }
         return BootSpan(scope: scope, descriptor: rootSpan.descriptor)
     }
 
@@ -222,6 +243,7 @@ struct BootMeasurementDescriptor: Sendable {
     let requestInstant: ContinuousClock.Instant
     let signposter: OSSignposter
     let handler: (@Sendable (BootInstrumentation.Measurement) -> Void)?
+    let diagnosticLevel: Hajime.DebugLogLevel
 }
 
 final class BootSpan: Sendable {
@@ -272,17 +294,21 @@ final class BootSpan: Sendable {
             )
         }
 
-        descriptor.handler?(
-            BootInstrumentation.Measurement(
-                bootstrap: descriptor.bootstrap,
-                runID: descriptor.runID,
-                attempt: descriptor.attempt,
-                scope: scope,
-                startOffset: descriptor.requestInstant.duration(to: start),
-                duration: start.duration(to: end),
-                outcome: outcome
-            )
+        let measurement = BootInstrumentation.Measurement(
+            bootstrap: descriptor.bootstrap,
+            runID: descriptor.runID,
+            attempt: descriptor.attempt,
+            scope: scope,
+            startOffset: descriptor.requestInstant.duration(to: start),
+            duration: start.duration(to: end),
+            outcome: outcome
         )
+        descriptor.handler?(measurement)
+        #if DEBUG
+        if descriptor.diagnosticLevel.includes(scope.timingLogLevel) {
+            hajimeLog.hajimeDebug(.timing(measurement))
+        }
+        #endif
     }
 }
 

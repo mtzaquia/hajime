@@ -21,8 +21,8 @@ tasks.
 | Level | Events |
 | --- | --- |
 | `.off` | No optional lifecycle logs. Configuration warnings remain enabled. This is the default. |
-| `.normal` | Boot, step, readiness-release, and signal waits, completions, cancellations, and failures. |
-| `.trace` | Everything in `.normal`, plus parallel boundaries, signal arming and rearming, buffered-result replay, and duplicate resolution. |
+| `.normal` | Boot, step, readiness-release, and signal lifecycle events, plus elapsed boot, scheduling, step, signal-wait, readiness-budget, and background-work intervals. |
+| `.trace` | Everything in `.normal`, plus parallel boundaries, operation and signal-handler timings, signal arming and rearming, buffered-result replay, and duplicate resolution. |
 
 Use `.normal` for routine boot investigation. Use `.trace` when the shape or
 overlap of the plan matters.
@@ -55,6 +55,37 @@ A readiness-release event names the affected step and reports either
 `after=immediate` or its configured budget. The step's later completion,
 cancellation, or failure keeps the same run identifier, so post-readiness work
 remains attributable to the execution that launched it.
+
+## Find slow startup work
+
+Normal diagnostics include timing lines built from Hajime's existing performance
+measurements, even without an Instruments recording:
+
+```text
+[timing][A1B2C3D4] • measured | boot="app-launch" attempt=1 scope=scheduling start=0.000s elapsed=0.001s outcome=succeeded
+[timing][A1B2C3D4] • measured | boot="app-launch" attempt=1 scope=step step="load-logbook" priority=user_initiated start=0.001s elapsed=0.045s outcome=succeeded
+[timing][A1B2C3D4] • measured | boot="app-launch" attempt=1 scope=readiness_budget step="sync-icloud" start=0.046s elapsed=2.001s outcome=released_readiness
+[timing][A1B2C3D4] • measured | boot="app-launch" attempt=1 scope=bootstrap start=0.000s elapsed=2.047s outcome=succeeded
+```
+
+The identifier matches lifecycle events and the prefix of the measurement's
+`runID`. `start` is an offset from this run's start request; `elapsed` is the
+measured duration, rather than a configured budget. Scheduling includes task
+dispatch and cooperative teardown of a replaced run. It is not a pure measure
+of Hajime's CPU overhead. A released readiness budget identifies a deliberate
+wait; later step and non-blocking timings describe work continuing after ready.
+Use `.trace` to separate a step's operation from its signal handlers and waits.
+
+Intervals nest and overlap, so do not add them together as a total. A bootstrap
+ends at readiness, failure, or cancellation. It does not measure work before
+`start()` or rendering after ready. Instrument synchronous app setup separately
+or move eligible setup into named boot steps. Timing lines appear when an
+interval ends; lifecycle starts identify a step still waiting to finish.
+
+The debug level at the start request enables timing collection for that run.
+`instrumentation: .disabled` disables timing collection, including console
+timings, while lifecycle events still follow `Hajime.debug`. Turn logging off
+and use release Instruments recordings for representative performance data.
 
 ## Diagnose delegate bridges
 

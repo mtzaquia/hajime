@@ -405,7 +405,7 @@ public final class Bootstrap: Observable, Sendable {
         signals: [any BootSignalBinding],
         run: BootSignalRun
     ) async throws {
-        try await HajimeLogTrace.withNewID {
+        try await HajimeLogTrace.withNewID(context.instrumentation.traceID) {
             hajimeLog.hajimeDebug(
                 .bootStarted(
                     stepCount: plan.stepCount,

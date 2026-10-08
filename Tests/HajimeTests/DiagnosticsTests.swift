@@ -38,6 +38,51 @@ private actor TraceIdentifierProbe {
 
 @Suite("Hajime diagnostics", .serialized)
 struct DiagnosticsTests {
+    @Test("Timing events separate readiness, scheduling, and background work")
+    func rendersTimingBreakdown() throws {
+        let runID = try #require(UUID(uuidString: "12345678-0000-0000-0000-000000000000"))
+        let measurement = BootInstrumentation.Measurement(
+            bootstrap: "app-launch", runID: runID, attempt: 2,
+            scope: .readinessBudget(step: "sync-icloud"),
+            startOffset: .milliseconds(125), duration: .seconds(2),
+            outcome: .releasedReadiness
+        )
+        #expect(HajimeLogEvent.timing(measurement).message ==
+            "[timing][12345678] • measured | boot=\"app-launch\" attempt=2 scope=readiness_budget step=\"sync-icloud\" start=0.125s elapsed=2.000s outcome=released_readiness")
+        let normal: [BootInstrumentation.Measurement.Scope] = [
+            .bootstrap, .scheduling, .step(name: "store", priority: .userInitiated),
+            .signalWait(signal: "callback", step: "store"),
+            .nonBlocking(step: "sync"), .readinessBudget(step: "sync")
+        ]
+        let trace: [BootInstrumentation.Measurement.Scope] = [
+            .operation(step: "store"), .signalHandler(signals: ["callback"], step: "store"), .parallel
+        ]
+        for scope in normal { #expect(scope.timingLogLevel == .normal) }
+        for scope in trace { #expect(scope.timingLogLevel == .trace) }
+        #expect(BootInstrumentation.Measurement.Scope.operation(step: "a\nb").timingDescription ==
+            "scope=operation step=\"a\\nb\"")
+        let failure = BootInstrumentation.Measurement(
+            bootstrap: "app-launch", runID: runID, attempt: 2,
+            scope: .bootstrap, startOffset: .zero, duration: .zero,
+            outcome: .init(SensitiveFailure())
+        )
+        #expect(!HajimeLogEvent.timing(failure).message.contains("customer-secret"))
+        #expect(HajimeLogEvent.timing(failure).message.contains("outcome=failed:SensitiveFailure"))
+    }
+
+    @Test("Timing diagnostics work without an Instruments recording and respect disabled")
+    func activatesTimingDiagnostics() {
+        let previous = Hajime.debug
+        defer { Hajime.debug = previous }
+        Hajime.debug = .normal
+        let automatic = BootRunInstrumentation(bootstrap: "launch", attempt: 1, configuration: .automatic)
+        #expect(automatic.traceID != nil)
+        #expect(automatic.start(.step(name: "store", priority: .userInitiated)) != nil)
+        let disabled = BootRunInstrumentation(bootstrap: "launch", attempt: 1, configuration: .disabled)
+        #expect(disabled.traceID == nil)
+        #expect(disabled.start(.bootstrap) == nil)
+    }
+
     @Test("Every event has a deliberate minimum level")
     func assignsEventLevels() {
         let normalEvents: [HajimeLogEvent] = [
